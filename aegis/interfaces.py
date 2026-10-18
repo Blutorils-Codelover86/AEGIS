@@ -44,31 +44,26 @@ class PermissionPolicy(Protocol):
 
 @dataclass(frozen=True)
 class ConfirmationToken:
-    """Cryptographically bound confirmation token for consequential actions."""
+    """Opaque, single-use approval capability bound to a request fingerprint and session.
 
-    fingerprint: str
+    Tokens cannot be instantiated via public factory methods by tool callers or models.
+    They are minted solely by an ApprovalAuthority and consumed atomically upon execution.
+    """
+
+    token_id: str
+    request_fingerprint: str
+    session_id: str
     action: str
     target: str | None = None
     created_at: str = ""
     comment: str = ""
 
-    @classmethod
-    def create(cls, request: PermissionRequest, comment: str = "") -> "ConfirmationToken":
-        from datetime import datetime, timezone
-        fp = compute_request_fingerprint(request)
-        ts = datetime.now(timezone.utc).isoformat()
-        return cls(
-            fingerprint=fp,
-            action=request.action,
-            target=request.target,
-            created_at=ts,
-            comment=comment,
-        )
-
-    def is_valid_for(self, request: PermissionRequest) -> bool:
+    def is_valid_for(self, request: PermissionRequest, session_id: str | None = None) -> bool:
         if self.action != request.action:
             return False
-        return self.fingerprint == compute_request_fingerprint(request)
+        if session_id is not None and self.session_id != session_id:
+            return False
+        return self.request_fingerprint == compute_request_fingerprint(request)
 
 
 def compute_request_fingerprint(request: PermissionRequest) -> str:

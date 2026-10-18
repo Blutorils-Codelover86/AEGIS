@@ -14,7 +14,7 @@ from aegis.interfaces import (
     MemoryStore,
     PermissionRequest,
 )
-from aegis.permissions import DeterministicPolicy
+from aegis.permissions import ApprovalAuthority, DeterministicPolicy
 from aegis.tools import ToolRegistry, ToolSpec, default_registry
 
 
@@ -71,7 +71,8 @@ class TestToolRegistry(unittest.TestCase):
         self.policy = DeterministicPolicy()
         self.audit = InMemoryAuditLogger()
         self.mock_memory = MockMemoryStore()
-        self.registry = default_registry(memory=self.mock_memory)
+        self.authority = ApprovalAuthority()
+        self.registry = default_registry(memory=self.mock_memory, authority=self.authority)
 
     def test_echo_tool_allowed(self) -> None:
         """Verify echo tool executes successfully under allowlist.readonly."""
@@ -148,7 +149,7 @@ class TestToolRegistry(unittest.TestCase):
 
         # Confirmed with valid token -> handler raises ToolError("shell execution is disabled")
         req = PermissionRequest(action="shell.exec", parameters={"command": "id"}, consequential=True)
-        token = ConfirmationToken.create(req)
+        token = self.authority.issue_token(req)
         with self.assertRaises(ToolError) as ctx_tool:
             self.registry.execute(
                 "run_shell",
@@ -197,7 +198,7 @@ class TestToolRegistry(unittest.TestCase):
             parameters={"content": "AEGIS safety core online", "tags": ["core", "safety"]},
             consequential=True,
         )
-        token = ConfirmationToken.create(req)
+        token = self.authority.issue_token(req)
         record = self.registry.execute(
             "save_memory",
             {"content": "AEGIS safety core online", "tags": ["core", "safety"]},
@@ -258,7 +259,7 @@ class TestToolRegistry(unittest.TestCase):
 
         # With valid ConfirmationToken -> deleted
         req = PermissionRequest(action="mem.delete", parameters={"id": rec.id}, consequential=True)
-        token = ConfirmationToken.create(req)
+        token = self.authority.issue_token(req)
         deleted = self.registry.execute(
             "delete_memory",
             {"id": rec.id},
@@ -271,14 +272,14 @@ class TestToolRegistry(unittest.TestCase):
 
     def test_memory_tools_raise_tool_error_if_memory_none(self) -> None:
         """Verify memory tools raise ToolError if memory store was not provided."""
-        empty_reg = default_registry(memory=None)
+        empty_reg = default_registry(memory=None, authority=self.authority)
 
         with self.assertRaises(ToolError) as ctx:
             empty_reg.execute("search_memory", {"query": "test"}, policy=self.policy, audit=self.audit)
         self.assertIn("Memory store is not available", str(ctx.exception))
 
         req = PermissionRequest(action="mem.save", parameters={"content": "test"}, consequential=True)
-        token = ConfirmationToken.create(req)
+        token = self.authority.issue_token(req)
         with self.assertRaises(ToolError) as ctx2:
             empty_reg.execute(
                 "save_memory",
@@ -414,6 +415,106 @@ class TestToolRegistry(unittest.TestCase):
                 )
             self.assertIn("redirect", str(ctx.exception).lower())
             t.join(timeout=2.0)
+
+    def test_confirmation_token_forgery_rejected(self) -> None:
+        """Verify forged ConfirmationToken not issued by authority is rejected (B2)."""
+        req = PermissionRequest(
+            action="mem.save",
+            parameters={"content": "malicious injection", "tags": []},
+            consequential=True,
+        )
+        forged_token = ConfirmationToken(
+            token_id="forged-token-uuid-12345",
+            session_id=self.authority.session_id,
+            request_fingerprint="some-fake-hash",
+            action="mem.save",
+        )
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.registry.execute(
+                "save_memory",
+                {"content": "malicious injection", "tags": []},
+                policy=self.policy,
+                audit=self.audit,
+                confirm=forged_token,
+            )
+        self.assertEqual(ctx.exception.result.decision, Decision.REQUIRE_CONFIRMATION)
+        self.assertIn("trusted approval", ctx.exception.result.reason)
+
+    def test_confirmation_token_replay_rejected(self) -> None:
+        """Verify single-use token cannot be replayed for a second execution (B2)."""
+        req = PermissionRequest(
+            action="mem.save",
+            parameters={"content": "single use content", "tags": []},
+            consequential=True,
+        )
+        token = self.authority.issue_token(req)
+
+        # First use succeeds
+        rec = self.registry.execute(
+            "save_memory",
+            {"content": "single use content", "tags": []},
+            policy=self.policy,
+            audit=self.audit,
+            confirm=token,
+        )
+        self.assertEqual(rec.content, "single use content")
+
+        # Second use (replay) fails with PermissionDenied
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.registry.execute(
+                "save_memory",
+                {"content": "single use content", "tags": []},
+                policy=self.policy,
+                audit=self.audit,
+                confirm=token,
+            )
+        self.assertEqual(ctx.exception.result.decision, Decision.REQUIRE_CONFIRMATION)
+        self.assertIn("trusted approval", ctx.exception.result.reason)
+
+    def test_confirmation_token_mismatched_request_rejected(self) -> None:
+        """Verify token issued for request A cannot be used to execute request B (B2)."""
+        req_a = PermissionRequest(
+            action="mem.save",
+            parameters={"content": "content A", "tags": []},
+            consequential=True,
+        )
+        token_a = self.authority.issue_token(req_a)
+
+        # Attempt to use token_a for different parameters
+        with self.assertRaises(PermissionDenied):
+            self.registry.execute(
+                "save_memory",
+                {"content": "content B", "tags": []},
+                policy=self.policy,
+                audit=self.audit,
+                confirm=token_a,
+            )
+
+    def test_fetch_url_rejects_non_http_schemes(self) -> None:
+        """Verify fetch_url rejects non-http schemes, missing host, and relative paths (B1)."""
+        disallowed_urls = [
+            "file:///etc/passwd",
+            "file://localhost/etc/hosts",
+            "ftp://ftp.example.com/pub/file.txt",
+            "data:text/plain;base64,SGVsbG8sIFdvcmxkIQ==",
+            "gopher://gopher.floodgap.com",
+            "/relative/path/to/resource",
+            "http:///missing-host",
+            "",
+        ]
+        for url in disallowed_urls:
+            with self.subTest(url=url):
+                with self.assertRaises(ToolError) as ctx:
+                    self.registry.execute(
+                        "fetch_url",
+                        {"url": url},
+                        policy=self.policy,
+                        audit=self.audit,
+                    )
+                self.assertTrue(
+                    any(phrase in str(ctx.exception).lower() for phrase in ("scheme", "hostname", "required", "invalid")),
+                    f"Unexpected error message for {url}: {ctx.exception}",
+                )
 
 
 if __name__ == "__main__":

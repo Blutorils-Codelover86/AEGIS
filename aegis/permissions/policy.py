@@ -16,39 +16,74 @@ from aegis.interfaces import (
 )
 
 
-def _is_loopback(target: str | None) -> bool:
-    """Check deterministically whether target resolves to a loopback address.
+def _validate_http_target(target: str | None) -> tuple[bool, str | None, bool]:
+    """Validate target for net.http actions.
 
-    Loopback targets: 127.0.0.1, localhost, ::1.
+    Returns (is_valid, hostname, is_loopback).
+    Rejects any scheme other than http/https (e.g. file:, ftp:, data:),
+    empty hostnames, relative paths without host, or unparseable URLs.
     """
     if not target or not isinstance(target, str):
-        return False
+        return False, None, False
     raw = target.strip()
-    if not raw:
-        return False
+    if not raw or raw.startswith("/"):
+        return False, None, False
 
     loopback_hosts = {"127.0.0.1", "localhost", "::1"}
 
-    # Exact hostname match (stripping brackets if IPv6)
-    cleaned = raw.removeprefix("[").removesuffix("]")
-    if cleaned.lower() in loopback_hosts:
-        return True
+    # If target has a scheme with ://
+    if "://" in raw:
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+        except Exception:
+            return False, None, False
 
-    url_to_parse = raw
-    if "://" not in raw and not raw.startswith("//"):
-        url_to_parse = f"http://{raw}"
+        scheme = parsed.scheme.lower()
+        if scheme not in ("http", "https"):
+            return False, None, False
 
-    try:
-        parsed = urllib.parse.urlsplit(url_to_parse)
         hostname = parsed.hostname
-        if hostname:
-            hostname = hostname.strip().lower()
-            if hostname in loopback_hosts:
-                return True
-    except Exception:
-        pass
+        if not hostname:
+            return False, None, False
 
-    return False
+        hostname = hostname.strip().lower()
+        return True, hostname, hostname in loopback_hosts
+
+    # If target starts with // (scheme-relative) -> reject, absolute http/https required
+    if raw.startswith("//"):
+        return False, None, False
+
+    # Target without :// - check if it contains a colon (could be IPv6, host:port, or scheme:data)
+    if ":" in raw:
+        # IPv6 address: e.g. [::1], ::1, [::1]:8080
+        if raw.startswith("[") or raw == "::1" or raw.count(":") >= 2:
+            cleaned = raw.split("]")[0].removeprefix("[").strip().lower()
+            return True, cleaned, cleaned in loopback_hosts
+        # Single colon: host:port OR non-http scheme like data:foo, mailto:foo
+        host_part, _, rest = raw.partition(":")
+        port_or_rest = rest.split("/")[0]
+        if port_or_rest.isdigit():
+            cleaned = host_part.strip().lower()
+            if not cleaned:
+                return False, None, False
+            return True, cleaned, cleaned in loopback_hosts
+        # Not a port -> non-http scheme, reject
+        return False, None, False
+
+    # Bare hostname or IP without port (e.g. localhost, 127.0.0.1, example.com)
+    cleaned = raw.split("/")[0].strip().lower()
+    if not cleaned:
+        return False, None, False
+    return True, cleaned, cleaned in loopback_hosts
+
+
+def _is_loopback(target: str | None) -> bool:
+    """Check deterministically whether target resolves to a loopback address.
+
+    Loopback targets: 127.0.0.1, localhost, ::1 under http/https schemes.
+    """
+    is_valid, _, is_loopback = _validate_http_target(target)
+    return is_valid and is_loopback
 
 
 class DeterministicPolicy:
@@ -161,7 +196,15 @@ class DeterministicPolicy:
                     )
                 target = url_param or tgt_param or request.parameters.get("host")
 
-            if _is_loopback(str(target) if target is not None else None):
+            is_valid, hostname, is_loopback = _validate_http_target(str(target) if target is not None else None)
+            if not is_valid:
+                return PermissionResult(
+                    decision=Decision.DENY,
+                    reason="Invalid or unsupported network scheme (only http and https with a concrete host are allowed)",
+                    rule="deny.network",
+                )
+
+            if is_loopback:
                 return PermissionResult(
                     decision=Decision.ALLOW,
                     reason="Loopback network target allowed",

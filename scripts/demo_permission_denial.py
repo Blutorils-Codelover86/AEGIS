@@ -23,7 +23,7 @@ from aegis.config import AegisConfig
 from aegis.errors import PermissionDenied
 from aegis.interfaces import ConfirmationToken, Decision, PermissionRequest
 from aegis.memory import SQLiteMemoryStore
-from aegis.permissions import DeterministicPolicy
+from aegis.permissions import ApprovalAuthority, DeterministicPolicy
 from aegis.tools import default_registry
 
 
@@ -92,7 +92,7 @@ def main() -> int:
         except PermissionDenied as e:
             print(f"DENIED (bare confirm=True rejected) rule={e.result.rule}")
 
-        # Step C: Attempt consequential action WITH cryptographically bound ConfirmationToken
+        # Step C: Attempt consequential action with forged token vs trusted ApprovalAuthority
         print("\n=== Step 3: Attempt consequential memory save WITH ConfirmationToken ===")
         auth_params = {"content": "Authorized memory write with confirmation", "tags": ("confirmed",)}
         auth_request = PermissionRequest(
@@ -100,8 +100,33 @@ def main() -> int:
             parameters=auth_params,
             consequential=True,
         )
-        token = ConfirmationToken.create(auth_request, comment="Human operator approved")
-        print(f"Issued ConfirmationToken (bound fingerprint={token.fingerprint[:16]}...)")
+
+        authority = ApprovalAuthority()
+        registry.authority = authority
+
+        # 3a. Forged token attempt (model/attacker crafts a fake ConfirmationToken)
+        forged_token = ConfirmationToken(
+            token_id="forged-token-id-1234567890",
+            request_fingerprint="forged-fingerprint",
+            session_id=authority.session_id,
+            action="mem.save",
+        )
+        try:
+            registry.execute(
+                "save_memory",
+                auth_params,
+                policy=policy,
+                audit=audit,
+                confirm=forged_token,
+            )
+            print("FAILURE: forged token was unexpectedly accepted!", file=sys.stderr)
+            return 1
+        except PermissionDenied:
+            print("DENIED (forged token rejected by authority)")
+
+        # 3b. Legitimate single-use token minted by trusted ApprovalAuthority
+        token = authority.issue_token(auth_request, comment="Human operator approved")
+        print(f"Issued single-use ConfirmationToken (token_id={token.token_id[:16]}..., bound={token.request_fingerprint[:16]}...)")
 
         record = registry.execute(
             "save_memory",
@@ -111,6 +136,20 @@ def main() -> int:
             confirm=token,
         )
         print(f"SUCCESS: memory saved with id={record.id} content='{record.content}'")
+
+        # 3c. Replay attempt with the exact same already-consumed token
+        try:
+            registry.execute(
+                "save_memory",
+                auth_params,
+                policy=policy,
+                audit=audit,
+                confirm=token,
+            )
+            print("FAILURE: replayed token was unexpectedly accepted!", file=sys.stderr)
+            return 1
+        except PermissionDenied:
+            print("DENIED (replayed token rejected: single-use token already consumed)")
 
         # Step D: Inspect structured audit records
         audit.close()

@@ -23,227 +23,121 @@ def _redact_url_credentials(url: str) -> str:
     try:
         import urllib.parse
         parsed = urllib.parse.urlsplit(url)
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
         if parsed.username or parsed.password:
-            netloc = parsed.hostname or ""
-            if parsed.port:
-                netloc = f"{netloc}:{parsed.port}"
             netloc = f"[REDACTED]@{netloc}"
-            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+        query = "[REDACTED_QUERY]" if parsed.query else ""
+        fragment = "[REDACTED_FRAGMENT]" if parsed.fragment else ""
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
     except Exception:
         pass
     return url
 
 
 def _redact_argv_for_audit(argv: list[str]) -> list[str]:
-    """Redact prompts, memory text, and URL credentials from CLI arguments for auditing."""
+    """Strict metadata allowlist for auditing CLI invocations.
+
+    Safe commands and flag names are preserved.
+    Sensitive payloads (prompt, system, memory text, tags, sources, queries, IDs)
+    are redacted regardless of option/position ordering.
+    """
+    if not argv:
+        return []
+
     redacted: list[str] = []
-    skip_next = False
-    for i, arg in enumerate(argv):
-        if skip_next:
-            skip_next = False
-            continue
-        if arg in {"--prompt", "--system"} and i + 1 < len(argv):
+    i = 0
+    subcommand: str | None = None
+    memory_action: str | None = None
+
+    while i < len(argv):
+        arg = argv[i]
+
+        if subcommand is None and arg in ("chat", "status", "memory", "stop"):
+            subcommand = arg
             redacted.append(arg)
-            redacted.append(f"[REDACTED len={len(argv[i+1])}]")
-            skip_next = True
-        elif len(redacted) >= 2 and redacted[-2] == "memory" and redacted[-1] == "save":
-            redacted.append(f"[REDACTED len={len(arg)}]")
+            i += 1
+            continue
+
+        if subcommand == "memory" and memory_action is None and arg in ("save", "search", "list", "delete"):
+            memory_action = arg
+            redacted.append(arg)
+            i += 1
+            continue
+
+        if arg in ("--prompt", "-p"):
+            redacted.append(arg)
+            if i + 1 < len(argv):
+                val = argv[i + 1]
+                redacted.append(f"[REDACTED len={len(val)}]")
+                i += 2
+                continue
+        elif arg in ("--system", "-s"):
+            redacted.append(arg)
+            if i + 1 < len(argv):
+                val = argv[i + 1]
+                redacted.append(f"[REDACTED len={len(val)}]")
+                i += 2
+                continue
+        elif arg in ("--tag", "-t"):
+            redacted.append(arg)
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                redacted.append("[REDACTED tag]")
+                i += 2
+            else:
+                i += 1
+            continue
+        elif arg in ("--source",):
+            redacted.append(arg)
+            if i + 1 < len(argv):
+                redacted.append("[REDACTED source]")
+                i += 2
+                continue
+        elif arg in ("--limit", "-n", "--turns", "--timeout"):
+            redacted.append(arg)
+            if i + 1 < len(argv):
+                val = argv[i + 1]
+                redacted.append(val if val.isdigit() else "[REDACTED]")
+                i += 2
+                continue
+        elif arg in ("--model", "-m"):
+            redacted.append(arg)
+            if i + 1 < len(argv):
+                redacted.append(argv[i + 1])
+                i += 2
+                continue
+        elif arg in ("--clear", "--help", "-h"):
+            redacted.append(arg)
+            i += 1
+            continue
+        elif arg.startswith("-"):
+            redacted.append(arg)
+            i += 1
+            continue
         else:
-            redacted.append(_redact_url_credentials(arg))
+            if subcommand == "memory":
+                if memory_action == "save":
+                    redacted.append(f"[REDACTED len={len(arg)}]")
+                elif memory_action == "search":
+                    redacted.append("[REDACTED query]")
+                elif memory_action == "delete":
+                    redacted.append("[REDACTED id]")
+                else:
+                    redacted.append("[REDACTED]")
+            elif subcommand == "chat":
+                redacted.append(f"[REDACTED len={len(arg)}]")
+            else:
+                redacted.append(_redact_url_credentials(arg))
+            i += 1
+
     return redacted
 
 
-class _FallbackSQLiteMemoryStore:
-    """Internal SQLite-backed memory store matching the MemoryStore protocol."""
-
-    def __init__(self, db_path: str) -> None:
-        self.db_path = os.path.abspath(os.path.expanduser(db_path))
-        parent = os.path.dirname(self.db_path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        self._lock = threading.Lock()
-        try:
-            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            with self._conn:
-                self._conn.execute(
-                    "CREATE TABLE IF NOT EXISTS memories ("
-                    "id TEXT PRIMARY KEY, "
-                    "content TEXT NOT NULL, "
-                    "tags TEXT NOT NULL DEFAULT '[]', "
-                    "source TEXT, "
-                    "created_at TEXT NOT NULL"
-                    ")"
-                )
-        except sqlite3.Error as e:
-            raise MemoryStoreError(f"Failed to initialize SQLite store: {e}") from e
-
-    def save(
-        self,
-        content: str,
-        *,
-        tags: Sequence[str] = (),
-        source: str | None = None,
-    ) -> MemoryRecord:
-        if not content or not content.strip():
-            raise MemoryStoreError("Memory content cannot be empty or whitespace")
-        rec_id = uuid.uuid4().hex
-        now = datetime.now(timezone.utc).isoformat()
-        tags_tuple = tuple(tags)
-        tags_json = json.dumps(list(tags_tuple))
-        with self._lock:
-            try:
-                with self._conn:
-                    self._conn.execute(
-                        "INSERT INTO memories (id, content, tags, source, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (rec_id, content, tags_json, source, now),
-                    )
-            except sqlite3.Error as e:
-                raise MemoryStoreError(f"Failed to save memory: {e}") from e
-        return MemoryRecord(
-            id=rec_id,
-            content=content,
-            tags=tags_tuple,
-            source=source,
-            created_at=now,
-        )
-
-    def search(self, query: str, *, limit: int = 5) -> list[MemoryRecord]:
-        q = query.strip()
-        if not q:
-            return []
-        limit = max(1, limit)
-        with self._lock:
-            try:
-                cur = self._conn.cursor()
-                cur.execute(
-                    "SELECT id, content, tags, source, created_at FROM memories "
-                    "ORDER BY created_at DESC, id ASC"
-                )
-                rows = cur.fetchall()
-            except sqlite3.Error as e:
-                raise MemoryStoreError(f"Failed to search memories: {e}") from e
-
-        results: list[MemoryRecord] = []
-        q_lower = q.lower()
-        for r_id, content, tags_json, source, created_at in rows:
-            try:
-                loaded_tags = json.loads(tags_json)
-                tag_tuple = tuple(loaded_tags) if isinstance(loaded_tags, list) else ()
-            except Exception:
-                tag_tuple = ()
-            tag_match = any(q_lower in t.lower() for t in tag_tuple)
-            if q_lower in content.lower() or tag_match:
-                results.append(
-                    MemoryRecord(
-                        id=r_id,
-                        content=content,
-                        tags=tag_tuple,
-                        source=source,
-                        created_at=created_at,
-                    )
-                )
-                if len(results) >= limit:
-                    break
-        return results
-
-    def count(self) -> int:
-        with self._lock:
-            try:
-                cur = self._conn.cursor()
-                cur.execute("SELECT COUNT(*) FROM memories")
-                row = cur.fetchone()
-                return int(row[0]) if row else 0
-            except sqlite3.Error as e:
-                raise MemoryStoreError(f"Failed to count memories: {e}") from e
-
-    def get(self, record_id: str) -> MemoryRecord | None:
-        with self._lock:
-            try:
-                cur = self._conn.cursor()
-                cur.execute(
-                    "SELECT id, content, tags, source, created_at FROM memories WHERE id = ?",
-                    (record_id,),
-                )
-                row = cur.fetchone()
-            except sqlite3.Error as e:
-                raise MemoryStoreError(f"Failed to get memory: {e}") from e
-        if not row:
-            return None
-        r_id, content, tags_json, source, created_at = row
-        try:
-            loaded_tags = json.loads(tags_json)
-            tag_tuple = tuple(loaded_tags) if isinstance(loaded_tags, list) else ()
-        except Exception:
-            tag_tuple = ()
-        return MemoryRecord(
-            id=r_id,
-            content=content,
-            tags=tag_tuple,
-            source=source,
-            created_at=created_at,
-        )
-
-    def delete(self, record_id: str) -> bool:
-        with self._lock:
-            try:
-                with self._conn:
-                    cur = self._conn.execute("DELETE FROM memories WHERE id = ?", (record_id,))
-                    return cur.rowcount > 0
-            except sqlite3.Error as e:
-                raise MemoryStoreError(f"Failed to delete memory: {e}") from e
-
-    def list(self, *, limit: int = 50) -> list[MemoryRecord]:
-        limit = max(1, limit)
-        with self._lock:
-            try:
-                cur = self._conn.cursor()
-                cur.execute(
-                    "SELECT id, content, tags, source, created_at FROM memories "
-                    "ORDER BY created_at DESC, id ASC LIMIT ?",
-                    (limit,),
-                )
-                rows = cur.fetchall()
-            except sqlite3.Error as e:
-                raise MemoryStoreError(f"Failed to list memories: {e}") from e
-        results: list[MemoryRecord] = []
-        for r_id, content, tags_json, source, created_at in rows:
-            try:
-                loaded_tags = json.loads(tags_json)
-                tag_tuple = tuple(loaded_tags) if isinstance(loaded_tags, list) else ()
-            except Exception:
-                tag_tuple = ()
-            results.append(
-                MemoryRecord(
-                    id=r_id,
-                    content=content,
-                    tags=tag_tuple,
-                    source=source,
-                    created_at=created_at,
-                )
-            )
-        return results
-
-    def close(self) -> None:
-        with self._lock:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-
-
 def _get_memory_store(db_path: str):
-    """Obtain a SQLiteMemoryStore, preferring aegis.memory if available."""
-    try:
-        from aegis.memory import SQLiteMemoryStore
-        return SQLiteMemoryStore(db_path)
-    except (ImportError, AttributeError):
-        pass
-    try:
-        from aegis.memory.store import SQLiteMemoryStore
-        return SQLiteMemoryStore(db_path)
-    except (ImportError, AttributeError):
-        pass
-    return _FallbackSQLiteMemoryStore(db_path)
+    """Obtain a SQLiteMemoryStore."""
+    from aegis.memory import SQLiteMemoryStore
+    return SQLiteMemoryStore(db_path)
 
 
 class _AegisArgumentParser(argparse.ArgumentParser):

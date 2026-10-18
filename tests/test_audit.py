@@ -127,42 +127,91 @@ class TestAuditLogger(unittest.TestCase):
         file_mode = stat.S_IMODE(os.stat(self.log_path).st_mode)
         self.assertEqual(file_mode, 0o600)
 
-    def test_audit_redaction_metadata_only(self) -> None:
-        """Verify CLI and tool auditing redacts raw prompt and memory text."""
+    def test_audit_cli_argv_redaction_permutations(self) -> None:
+        """Verify CLI argv redaction handles all flag and positional permutations (M2)."""
         from aegis.cli.main import _redact_argv_for_audit
-        from aegis.tools.registry import _redact_params_for_audit, _redact_url_credentials
 
-        # Test CLI argv redaction
-        cli_argv = ["chat", "--prompt", "Super confidential prompt text", "--system", "Secret system prompt"]
-        redacted_cli = _redact_argv_for_audit(cli_argv)
-        self.assertNotIn("Super confidential prompt text", redacted_cli)
-        self.assertIn("[REDACTED len=30]", redacted_cli)
-        self.assertNotIn("Secret system prompt", redacted_cli)
-        self.assertIn("[REDACTED len=20]", redacted_cli)
+        # Permutation 1: memory save with options before positional content
+        mem_argv1 = ["memory", "save", "--tag", "secret-tag-1", "very confidential fact", "--source", "secret-source-1"]
+        redacted1 = _redact_argv_for_audit(mem_argv1)
+        redacted1_str = " ".join(redacted1)
+        self.assertNotIn("secret-tag-1", redacted1_str)
+        self.assertNotIn("very confidential fact", redacted1_str)
+        self.assertNotIn("secret-source-1", redacted1_str)
+        self.assertIn("[REDACTED tag]", redacted1_str)  # secret-tag-1
+        self.assertIn("[REDACTED len=22]", redacted1_str)  # very confidential fact
+        self.assertIn("[REDACTED source]", redacted1_str)  # secret-source-1
 
-        # Test memory save argv redaction
-        mem_argv = ["memory", "save", "Secret memory content that must not be in logs", "--tag", "test"]
-        redacted_mem = _redact_argv_for_audit(mem_argv)
-        self.assertNotIn("Secret memory content that must not be in logs", redacted_mem)
-        self.assertIn("[REDACTED len=46]", redacted_mem)
+        # Permutation 2: memory save with options after positional content
+        mem_argv2 = ["memory", "save", "another confidential fact", "--source", "secret-source-2", "--tag", "secret-tag-2"]
+        redacted2 = _redact_argv_for_audit(mem_argv2)
+        redacted2_str = " ".join(redacted2)
+        self.assertNotIn("secret-tag-2", redacted2_str)
+        self.assertNotIn("another confidential fact", redacted2_str)
+        self.assertNotIn("secret-source-2", redacted2_str)
+        self.assertIn("[REDACTED len=25]", redacted2_str)
+        self.assertIn("[REDACTED source]", redacted2_str)
+        self.assertIn("[REDACTED tag]", redacted2_str)
 
-        # Test URL credential stripping
-        url_with_creds = "http://admin:secret123@127.0.0.1:8080/data"
-        stripped = _redact_url_credentials(url_with_creds)
-        self.assertNotIn("secret123", stripped)
-        self.assertNotIn("admin", stripped)
-        self.assertIn("[REDACTED]@127.0.0.1:8080/data", stripped)
+        # Permutation 3: memory delete / get record ID redaction
+        del_argv = ["memory", "delete", "mem-uuid-99999-private"]
+        redacted_del = _redact_argv_for_audit(del_argv)
+        self.assertNotIn("mem-uuid-99999-private", " ".join(redacted_del))
+        self.assertIn("[REDACTED id]", " ".join(redacted_del))
 
-        # Test tool params redaction
+        get_argv = ["memory", "get", "mem-uuid-88888-private"]
+        redacted_get = _redact_argv_for_audit(get_argv)
+        self.assertNotIn("mem-uuid-88888-private", " ".join(redacted_get))
+
+        # Permutation 4: chat permutations
+        chat_argv1 = ["chat", "--system", "SuperSecretSys", "--prompt", "SuperSecretPrompt"]
+        redacted_chat1 = _redact_argv_for_audit(chat_argv1)
+        self.assertNotIn("SuperSecretSys", " ".join(redacted_chat1))
+        self.assertNotIn("SuperSecretPrompt", " ".join(redacted_chat1))
+
+        chat_argv2 = ["chat", "--prompt", "SuperSecretPrompt", "--system", "SuperSecretSys"]
+        redacted_chat2 = _redact_argv_for_audit(chat_argv2)
+        self.assertNotIn("SuperSecretSys", " ".join(redacted_chat2))
+        self.assertNotIn("SuperSecretPrompt", " ".join(redacted_chat2))
+
+    def test_audit_url_query_and_credential_redaction(self) -> None:
+        """Verify URL query parameters and credentials are scrubbed in audit (M2)."""
+        from aegis.tools.registry import _redact_url_for_audit
+
+        sensitive_url = "http://alice:supersecret@127.0.0.1:8080/v1/resource?token=secrettoken&api_key=privkey123#frag"
+        redacted = _redact_url_for_audit(sensitive_url)
+        self.assertNotIn("alice", redacted)
+        self.assertNotIn("supersecret", redacted)
+        self.assertNotIn("secrettoken", redacted)
+        self.assertNotIn("privkey123", redacted)
+        self.assertIn("[REDACTED]@127.0.0.1:8080/v1/resource", redacted)
+        self.assertIn("?[REDACTED_QUERY]", redacted)
+        self.assertIn("#[REDACTED_FRAGMENT]", redacted)
+
+    def test_audit_tool_params_redaction(self) -> None:
+        """Verify tool params redact content, tags, sources, ids, query strings, and unknown keys (M2)."""
+        from aegis.tools.registry import _redact_params_for_audit
+
         tool_params = {
             "content": "Secret note to be saved in memory",
-            "url": "http://user:password@localhost:5000/api",
-            "normal_param": 42,
+            "tags": ["secret-tag", "confidential"],
+            "source": "secret-document-v1",
+            "id": "mem-private-123",
+            "query": "search for nuclear launch codes",
+            "url": "http://user:password@localhost:5000/api?token=abc",
+            "unknown_arbitrary_key": "arbitrary confidential payload",
+            "limit": 10,
         }
-        redacted_params = _redact_params_for_audit(tool_params)
-        self.assertEqual(redacted_params["content"], "[REDACTED len=33]")
-        self.assertNotIn("password", redacted_params["url"])
-        self.assertEqual(redacted_params["normal_param"], 42)
+        redacted = _redact_params_for_audit(tool_params)
+        self.assertEqual(redacted["content"], "[REDACTED len=33]")
+        self.assertEqual(redacted["tags"], ["[REDACTED tag]", "[REDACTED tag]"])
+        self.assertEqual(redacted["source"], "[REDACTED source]")
+        self.assertEqual(redacted["id"], "[REDACTED id]")
+        self.assertEqual(redacted["query"], "[REDACTED query]")
+        self.assertNotIn("password", redacted["url"])
+        self.assertNotIn("token=abc", redacted["url"])
+        self.assertEqual(redacted["unknown_arbitrary_key"], "[REDACTED len=30]")
+        self.assertEqual(redacted["limit"], 10)
 
 
 if __name__ == "__main__":

@@ -1,39 +1,43 @@
 """Ollama model provider implementation for Project AEGIS."""
 from __future__ import annotations
 
+import io
 import json
+import select
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Sequence
-from unittest.mock import MagicMock
 
 from aegis.errors import ProviderError, StopRequested
 
 
 def _is_loopback_host(target: str | None) -> bool:
-    """Check deterministically whether target resolves to a loopback address."""
+    """Check deterministically whether target resolves to a loopback address under http/https."""
     if not target or not isinstance(target, str):
         return False
     raw = target.strip()
     if not raw:
         return False
     loopback_hosts = {"127.0.0.1", "localhost", "::1"}
-    cleaned = raw.removeprefix("[").removesuffix("]")
-    if cleaned.lower() in loopback_hosts:
-        return True
-    url_to_parse = raw
     if "://" not in raw and not raw.startswith("//"):
-        url_to_parse = f"http://{raw}"
+        cleaned = raw.split("/")[0].split(":")[0].removeprefix("[").removesuffix("]").strip().lower()
+        return cleaned in loopback_hosts
+
     try:
-        parsed = urllib.parse.urlsplit(url_to_parse)
-        hostname = parsed.hostname
-        if hostname:
-            if hostname.strip().lower() in loopback_hosts:
-                return True
+        parsed = urllib.parse.urlsplit(raw)
     except Exception:
-        pass
-    return False
+        return False
+
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+
+    return hostname.strip().lower() in loopback_hosts
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -69,22 +73,38 @@ class OllamaProvider:
         default_model: str,
         timeout: float = 120.0,
         allow_network: bool = False,
+        *,
+        opener: Any = None,
     ) -> None:
-        if not _is_loopback_host(host) and not allow_network:
+        raw_host = host.rstrip("/")
+        try:
+            parsed = urllib.parse.urlsplit(raw_host)
+        except Exception as e:
+            raise ProviderError(f"Malformed Ollama host '{host}': {e}") from e
+
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise ProviderError(
+                f"Invalid Ollama host '{host}': scheme must be http or https"
+            )
+        if not parsed.hostname:
+            raise ProviderError(
+                f"Invalid Ollama host '{host}': concrete hostname is required"
+            )
+
+        if not _is_loopback_host(raw_host) and not allow_network:
             raise ProviderError(
                 f"Non-loopback Ollama host '{host}' rejected: network access is disabled"
             )
-        self.host = host.rstrip("/")
+
+        self.host = raw_host
         self.default_model = default_model
         self.timeout = float(timeout)
         self.allow_network = allow_network
         self._last_error: str | None = None
+        self._opener = opener if opener is not None else urllib.request.build_opener(_NoRedirectHandler())
 
     def _open(self, req: urllib.request.Request, timeout: float):
-        if isinstance(urllib.request.urlopen, MagicMock):
-            return urllib.request.urlopen(req, timeout=timeout)
-        opener = urllib.request.build_opener(_NoRedirectHandler())
-        return opener.open(req, timeout=timeout)
+        return self._opener.open(req, timeout=timeout)
 
     def last_error(self) -> str | None:
         """Return the last recorded error message for diagnostics."""
@@ -127,12 +147,34 @@ class OllamaProvider:
             with self._open(req, timeout=self.timeout) as resp:
                 if stop_check is not None and (hasattr(resp, "readline") or hasattr(resp, "__iter__")):
                     chunks: list[str] = []
-                    # Stream lines and check stop periodically
-                    lines_iter = resp if hasattr(resp, "__iter__") else iter(resp.readline, b"")
-                    for line in lines_iter:
+                    deadline = time.monotonic() + self.timeout
+
+                    # Obtain fileno if available for non-blocking select polling
+                    fn: int | None = None
+                    if hasattr(resp, "fileno"):
+                        try:
+                            fn = resp.fileno()
+                        except Exception:
+                            fn = None
+
+                    while True:
                         stop_check()
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(f"Ollama stream timed out after {self.timeout}s")
+
+                        if fn is not None and fn >= 0:
+                            try:
+                                r, _, _ = select.select([fn], [], [], 0.1)
+                                if not r:
+                                    # Connection stalled or waiting; continue polling stop_check
+                                    continue
+                            except (io.UnsupportedOperation, OSError):
+                                fn = None
+
+                        line = resp.readline()
                         if not line:
-                            continue
+                            break
+
                         stripped = line.strip()
                         if not stripped:
                             continue
@@ -145,6 +187,7 @@ class OllamaProvider:
                                     break
                         except Exception:
                             pass
+
                     result = "".join(chunks)
                     if not result:
                         msg = "Ollama returned an empty response"

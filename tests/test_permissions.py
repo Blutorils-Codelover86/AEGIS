@@ -297,6 +297,30 @@ class TestDeterministicPolicy(unittest.TestCase):
         self.assertEqual(audit.events[1].decision, "deny")
         self.assertEqual(audit.events[1].details["rule"], "deny.shell")
 
+    def test_net_http_scheme_enforcement(self) -> None:
+        """Verify net.http strictly requires http/https even if allow_network=True (B1)."""
+        permissive = DeterministicPolicy(allow_network=True)
+        default_policy = DeterministicPolicy()
+
+        invalid_targets = [
+            "file:///etc/passwd",
+            "file://localhost/etc/hosts",
+            "ftp://ftp.example.com/file",
+            "data:text/plain;base64,aGVsbG8=",
+            "gopher://evil.com",
+            "/absolute/local/path",
+            "http:///missing-hostname",
+        ]
+
+        for target in invalid_targets:
+            for pol in (default_policy, permissive):
+                with self.subTest(target=target, policy=pol):
+                    req = PermissionRequest(action="net.http", target=target)
+                    res = pol.evaluate(req)
+                    self.assertEqual(res.decision, Decision.DENY)
+                    self.assertEqual(res.rule, "deny.network")
+                    self.assertIn("scheme", res.reason.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
