@@ -29,6 +29,24 @@ pip install -e ".[dev]"
 
 ---
 
+## Quickstart & Demo
+
+Run the automated end-to-end Sprint 001 demonstration:
+
+```bash
+bash scripts/demo_sprint001.sh
+```
+
+Or run the deterministic permission denial demonstration directly (no LLM required):
+
+```bash
+python3 scripts/demo_permission_denial.py
+```
+
+See [docs/DEMO.md](docs/DEMO.md) for full output transcripts, reproduction logs, and the Definition of Done (DoD) verification checklist.
+
+---
+
 ## CLI Overview
 
 AEGIS exposes an intuitive command-line interface:
