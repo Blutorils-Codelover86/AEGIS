@@ -117,6 +117,54 @@ class TestAuditLogger(unittest.TestCase):
         for r in records:
             self.assertTrue(r.timestamp.endswith("+00:00"))
 
+    def test_audit_file_permissions_0600(self) -> None:
+        """Verify audit file is created with 0600 permissions."""
+        import stat
+        logger = JsonlAuditLogger(self.log_path)
+        logger.log(AuditEvent(event="perm.test", actor="user"))
+        logger.close()
+
+        file_mode = stat.S_IMODE(os.stat(self.log_path).st_mode)
+        self.assertEqual(file_mode, 0o600)
+
+    def test_audit_redaction_metadata_only(self) -> None:
+        """Verify CLI and tool auditing redacts raw prompt and memory text."""
+        from aegis.cli.main import _redact_argv_for_audit
+        from aegis.tools.registry import _redact_params_for_audit, _redact_url_credentials
+
+        # Test CLI argv redaction
+        cli_argv = ["chat", "--prompt", "Super confidential prompt text", "--system", "Secret system prompt"]
+        redacted_cli = _redact_argv_for_audit(cli_argv)
+        self.assertNotIn("Super confidential prompt text", redacted_cli)
+        self.assertIn("[REDACTED len=30]", redacted_cli)
+        self.assertNotIn("Secret system prompt", redacted_cli)
+        self.assertIn("[REDACTED len=20]", redacted_cli)
+
+        # Test memory save argv redaction
+        mem_argv = ["memory", "save", "Secret memory content that must not be in logs", "--tag", "test"]
+        redacted_mem = _redact_argv_for_audit(mem_argv)
+        self.assertNotIn("Secret memory content that must not be in logs", redacted_mem)
+        self.assertIn("[REDACTED len=46]", redacted_mem)
+
+        # Test URL credential stripping
+        url_with_creds = "http://admin:secret123@127.0.0.1:8080/data"
+        stripped = _redact_url_credentials(url_with_creds)
+        self.assertNotIn("secret123", stripped)
+        self.assertNotIn("admin", stripped)
+        self.assertIn("[REDACTED]@127.0.0.1:8080/data", stripped)
+
+        # Test tool params redaction
+        tool_params = {
+            "content": "Secret note to be saved in memory",
+            "url": "http://user:password@localhost:5000/api",
+            "normal_param": 42,
+        }
+        redacted_params = _redact_params_for_audit(tool_params)
+        self.assertEqual(redacted_params["content"], "[REDACTED len=33]")
+        self.assertNotIn("password", redacted_params["url"])
+        self.assertEqual(redacted_params["normal_param"], 42)
+
 
 if __name__ == "__main__":
     unittest.main()
+

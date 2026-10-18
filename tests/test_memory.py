@@ -317,6 +317,36 @@ class TestMemoryStore(unittest.TestCase):
         self.assertEqual(rec3.tags, ("tag3",))
         conn.close()
 
+    def test_search_punctuation_and_escaped_tags(self) -> None:
+        """Verify search against JSON structural punctuation does not falsely match (m1)."""
+        r1 = self.store.save("Plain alpha text", tags=("alpha", "beta"))
+        r2 = self.store.save("Plain gamma text", tags=("complex,tag", "quote\"inside"))
+
+        # Queries matching JSON structure syntax must not match tags
+        self.assertEqual(self.store.search('","'), [])
+        self.assertEqual(self.store.search("["), [])
+        self.assertEqual(self.store.search("]"), [])
+
+        # Queries matching literal tag contents with punctuation should match
+        matches_comma = self.store.search("complex,tag")
+        self.assertEqual(len(matches_comma), 1)
+        self.assertEqual(matches_comma[0].id, r2.id)
+
+        matches_quote = self.store.search('quote"inside')
+        self.assertEqual(len(matches_quote), 1)
+        self.assertEqual(matches_quote[0].id, r2.id)
+
+    def test_upper_bound_limits_and_count(self) -> None:
+        """Verify search and list clamp maximum limits and count() is accurate (m2)."""
+        self.assertEqual(self.store.count(), 0)
+        for i in range(5):
+            self.store.save(f"Record {i}", tags=(f"tag{i}",))
+        self.assertEqual(self.store.count(), 5)
+
+        # Capped at 500 when requested limit is 1000000
+        records = self.store.list(limit=1000000)
+        self.assertEqual(len(records), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

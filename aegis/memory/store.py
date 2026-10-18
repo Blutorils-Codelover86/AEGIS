@@ -97,18 +97,20 @@ class SQLiteMemoryStore:
         )
 
     def search(self, query: str, *, limit: int = 5) -> list[MemoryRecord]:
-        """Search memories case-insensitively by content and tags JSON."""
+        """Search memories case-insensitively by content and decoded tag values."""
         if not isinstance(query, str) or not query.strip():
             return []
 
-        clamped_limit = max(1, int(limit))
+        clamped_limit = min(max(1, int(limit)), 500)
         with self._lock:
             conn = self._ensure_open()
             try:
                 cur = conn.execute(
                     "SELECT id, content, tags, source, created_at FROM memories "
                     "WHERE instr(lower(content), lower(?)) > 0 "
-                    "   OR instr(lower(tags), lower(?)) > 0 "
+                    "   OR (json_valid(tags) AND EXISTS ("
+                    "       SELECT 1 FROM json_each(tags) WHERE instr(lower(value), lower(?)) > 0"
+                    "   )) "
                     "ORDER BY created_at DESC, id ASC "
                     "LIMIT ?",
                     (query, query, clamped_limit),
@@ -150,7 +152,7 @@ class SQLiteMemoryStore:
 
     def list(self, *, limit: int = 50) -> list[MemoryRecord]:
         """List memories ordered by created_at DESC, id ASC."""
-        clamped_limit = max(1, int(limit))
+        clamped_limit = min(max(1, int(limit)), 500)
         with self._lock:
             conn = self._ensure_open()
             try:

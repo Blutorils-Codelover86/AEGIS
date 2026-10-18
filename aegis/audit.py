@@ -19,7 +19,13 @@ class JsonlAuditLogger:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self._lock = threading.Lock()
-        self._file = open(self.path, "a", encoding="utf-8")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        self._file = open(fd, "a", encoding="utf-8")
 
     def log(self, event: AuditEvent) -> None:
         with self._lock:
@@ -31,7 +37,13 @@ class JsonlAuditLogger:
                 self._file.write(line + "\n")
                 self._file.flush()
             else:
-                with open(self.path, "a", encoding="utf-8") as f:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                fd = os.open(self.path, flags, 0o600)
+                try:
+                    os.chmod(self.path, 0o600)
+                except OSError:
+                    pass
+                with open(fd, "a", encoding="utf-8") as f:
                     f.write(line + "\n")
 
     def close(self) -> None:

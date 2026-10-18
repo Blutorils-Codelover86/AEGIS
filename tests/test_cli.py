@@ -11,7 +11,7 @@ from typing import Sequence
 from unittest.mock import patch
 
 from aegis.audit import read_events
-from aegis.cli.main import main
+from aegis.cli.main import _get_memory_store, main
 from aegis.config import AegisConfig
 from aegis.errors import ProviderError
 from aegis.stop import StopController
@@ -41,8 +41,12 @@ class FakeProvider:
         system: str | None = None,
         model: str | None = None,
         stop: Sequence[str] | None = None,
+        stop_check: Any = None,
+        **kwargs: Any,
     ) -> str:
         self.calls.append({"prompt": prompt, "system": system, "model": model, "stop": stop})
+        if stop_check is not None:
+            stop_check()
         if self.raise_on_generate is not None:
             raise self.raise_on_generate
         return self.response
@@ -225,6 +229,46 @@ class TestCLI(unittest.TestCase):
         with redirect_stdout(out):
             rc = main([], config=self.config)
         self.assertEqual(rc, 2)
+
+    def test_chat_single_shot_keyboard_interrupt(self) -> None:
+        """Verify KeyboardInterrupt during single-shot prompt exits cleanly with code 130 (M3)."""
+        fake = FakeProvider(raise_on_generate=KeyboardInterrupt())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = main(["chat", "--prompt", "test prompt"], provider=fake, config=self.config)
+        self.assertEqual(rc, 130)
+        self.assertIn("Stop requested by user", out.getvalue())
+
+    def test_stop_arriving_during_slow_generation(self) -> None:
+        """Verify StopRequested arriving during generation interrupts and returns 130 (M3)."""
+        cfg = self.config
+
+        class SlowProvider(FakeProvider):
+            def generate(self, prompt, **kwargs):
+                stop_check = kwargs.get("stop_check")
+                StopController(cfg.stop_file).request_stop("monitor")
+                if stop_check:
+                    stop_check()
+                return "never reached"
+
+        fake = SlowProvider()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = main(["chat", "--prompt", "slow generation"], provider=fake, config=self.config)
+        self.assertEqual(rc, 130)
+
+    def test_chat_never_persists_memory(self) -> None:
+        """Verify chat mode never creates or persists memories implicitly."""
+        fake = FakeProvider(response="I remember nothing")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = main(["chat", "--prompt", "Don't save me"], provider=fake, config=self.config)
+        self.assertEqual(rc, 0)
+        store = _get_memory_store(self.db_path)
+        try:
+            self.assertEqual(store.count(), 0)
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

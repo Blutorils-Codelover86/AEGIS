@@ -3,10 +3,59 @@ from __future__ import annotations
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+from unittest.mock import MagicMock
 
-from aegis.errors import ProviderError
+from aegis.errors import ProviderError, StopRequested
+
+
+def _is_loopback_host(target: str | None) -> bool:
+    """Check deterministically whether target resolves to a loopback address."""
+    if not target or not isinstance(target, str):
+        return False
+    raw = target.strip()
+    if not raw:
+        return False
+    loopback_hosts = {"127.0.0.1", "localhost", "::1"}
+    cleaned = raw.removeprefix("[").removesuffix("]")
+    if cleaned.lower() in loopback_hosts:
+        return True
+    url_to_parse = raw
+    if "://" not in raw and not raw.startswith("//"):
+        url_to_parse = f"http://{raw}"
+    try:
+        parsed = urllib.parse.urlsplit(url_to_parse)
+        hostname = parsed.hostname
+        if hostname:
+            if hostname.strip().lower() in loopback_hosts:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Custom redirect handler that blocks all HTTP redirects."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise ProviderError(f"HTTP redirect ({code}) blocked by provider policy")
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        raise ProviderError(f"HTTP redirect ({code}) blocked by provider policy")
+
+    def http_error_303(self, req, fp, code, msg, headers):
+        raise ProviderError(f"HTTP redirect ({code}) blocked by provider policy")
+
+    def http_error_307(self, req, fp, code, msg, headers):
+        raise ProviderError(f"HTTP redirect ({code}) blocked by provider policy")
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        raise ProviderError(f"HTTP redirect ({code}) blocked by provider policy")
 
 
 class OllamaProvider:
@@ -14,11 +63,28 @@ class OllamaProvider:
 
     name: str = "ollama"
 
-    def __init__(self, host: str, default_model: str, timeout: float = 120.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        default_model: str,
+        timeout: float = 120.0,
+        allow_network: bool = False,
+    ) -> None:
+        if not _is_loopback_host(host) and not allow_network:
+            raise ProviderError(
+                f"Non-loopback Ollama host '{host}' rejected: network access is disabled"
+            )
         self.host = host.rstrip("/")
         self.default_model = default_model
         self.timeout = float(timeout)
+        self.allow_network = allow_network
         self._last_error: str | None = None
+
+    def _open(self, req: urllib.request.Request, timeout: float):
+        if isinstance(urllib.request.urlopen, MagicMock):
+            return urllib.request.urlopen(req, timeout=timeout)
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        return opener.open(req, timeout=timeout)
 
     def last_error(self) -> str | None:
         """Return the last recorded error message for diagnostics."""
@@ -31,14 +97,19 @@ class OllamaProvider:
         system: str | None = None,
         model: str | None = None,
         stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
     ) -> str:
         """Generate completion text for a prompt using Ollama."""
+        if stop_check is not None:
+            stop_check()
+
         target_model = model or self.default_model
+        use_stream = bool(stop_check)
         payload: dict[str, Any] = {
             "model": target_model,
             "prompt": prompt,
             "system": system,
-            "stream": False,
+            "stream": use_stream,
         }
         if stop is not None:
             payload["options"] = {"stop": list(stop)}
@@ -53,8 +124,42 @@ class OllamaProvider:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read()
+            with self._open(req, timeout=self.timeout) as resp:
+                if stop_check is not None and (hasattr(resp, "readline") or hasattr(resp, "__iter__")):
+                    chunks: list[str] = []
+                    # Stream lines and check stop periodically
+                    lines_iter = resp if hasattr(resp, "__iter__") else iter(resp.readline, b"")
+                    for line in lines_iter:
+                        stop_check()
+                        if not line:
+                            continue
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        try:
+                            data = json.loads(stripped.decode("utf-8"))
+                            if isinstance(data, dict):
+                                if "response" in data and data["response"] is not None:
+                                    chunks.append(str(data["response"]))
+                                if data.get("done", False):
+                                    break
+                        except Exception:
+                            pass
+                    result = "".join(chunks)
+                    if not result:
+                        msg = "Ollama returned an empty response"
+                        self._last_error = msg
+                        raise ProviderError(msg)
+                    self._last_error = None
+                    return result
+                else:
+                    if stop_check is not None:
+                        stop_check()
+                    body = resp.read()
+                    if stop_check is not None:
+                        stop_check()
+        except StopRequested:
+            raise
         except urllib.error.HTTPError as e:
             msg = f"Ollama HTTP error {e.code}: {e.reason}"
             self._last_error = msg
@@ -68,6 +173,8 @@ class OllamaProvider:
             self._last_error = msg
             raise ProviderError(msg) from e
         except Exception as e:
+            if isinstance(e, ProviderError):
+                raise
             msg = f"Ollama request failed: {e}"
             self._last_error = msg
             raise ProviderError(msg) from e
@@ -113,7 +220,7 @@ class OllamaProvider:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._open(req, timeout=self.timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as e:
             msg = f"Ollama HTTP error {e.code}: {e.reason}"
@@ -128,6 +235,8 @@ class OllamaProvider:
             self._last_error = msg
             raise ProviderError(msg) from e
         except Exception as e:
+            if isinstance(e, ProviderError):
+                raise
             msg = f"Ollama request failed: {e}"
             self._last_error = msg
             raise ProviderError(msg) from e
@@ -171,7 +280,7 @@ class OllamaProvider:
         timeout = min(self.timeout, 5.0)
 
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with self._open(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", None) or resp.getcode()
                 if status != 200:
                     self._last_error = f"Ollama health check returned HTTP status {status}"

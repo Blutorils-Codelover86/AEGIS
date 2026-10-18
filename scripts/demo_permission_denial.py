@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Deterministic demo of AEGIS permission denial and policy enforcement.
+"""Deterministic demo of AEGIS permission denial, confirmation token binding, and policy enforcement.
 
 No LLM model or external services required.
 Demonstrates:
 1. Deny-by-default on dangerous actions (run_shell -> PermissionDenied).
-2. Requirement of confirmation for consequential actions (save_memory -> PermissionDenied without confirm).
-3. Successful execution when confirmed (save_memory -> success with confirm=True).
-4. Structured JSON Lines audit logging of all decisions and outcomes.
+2. Requirement of ConfirmationToken for consequential actions (save_memory -> PermissionDenied without token or with bare confirm=True).
+3. Successful execution when confirmed via trusted ConfirmationToken bound to the request.
+4. Structured JSON Lines audit logging of all decisions and outcomes with sensitive content redaction.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aegis.audit import JsonlAuditLogger
 from aegis.config import AegisConfig
 from aegis.errors import PermissionDenied
-from aegis.interfaces import Decision
+from aegis.interfaces import ConfirmationToken, Decision, PermissionRequest
 from aegis.memory import SQLiteMemoryStore
 from aegis.permissions import DeterministicPolicy
 from aegis.tools import default_registry
@@ -58,10 +58,11 @@ def main() -> int:
 
         # Step B: Attempt consequential action WITHOUT confirmation (save_memory)
         print("\n=== Step 2: Attempt consequential memory save WITHOUT confirmation ===")
+        mem_params = {"content": "Unauthorized memory write attempt", "tags": ("unconfirmed",)}
         try:
             registry.execute(
                 "save_memory",
-                {"content": "Unauthorized memory write attempt", "tags": ("unconfirmed",)},
+                mem_params,
                 policy=policy,
                 audit=audit,
                 confirm=False,
@@ -77,14 +78,37 @@ def main() -> int:
                 return 1
             print(f"DENIED rule={e.result.rule} reason={e.result.reason}")
 
-        # Step C: Attempt consequential action WITH confirmation (save_memory)
-        print("\n=== Step 3: Attempt consequential memory save WITH confirmation ===")
+        # Also prove that bare caller-supplied confirm=True is rejected
+        try:
+            registry.execute(
+                "save_memory",
+                mem_params,
+                policy=policy,
+                audit=audit,
+                confirm=True,
+            )
+            print("FAILURE: bare confirm=True was unexpectedly accepted!", file=sys.stderr)
+            return 1
+        except PermissionDenied as e:
+            print(f"DENIED (bare confirm=True rejected) rule={e.result.rule}")
+
+        # Step C: Attempt consequential action WITH cryptographically bound ConfirmationToken
+        print("\n=== Step 3: Attempt consequential memory save WITH ConfirmationToken ===")
+        auth_params = {"content": "Authorized memory write with confirmation", "tags": ("confirmed",)}
+        auth_request = PermissionRequest(
+            action="mem.save",
+            parameters=auth_params,
+            consequential=True,
+        )
+        token = ConfirmationToken.create(auth_request, comment="Human operator approved")
+        print(f"Issued ConfirmationToken (bound fingerprint={token.fingerprint[:16]}...)")
+
         record = registry.execute(
             "save_memory",
-            {"content": "Authorized memory write with confirmation", "tags": ("confirmed",)},
+            auth_params,
             policy=policy,
             audit=audit,
-            confirm=True,
+            confirm=token,
         )
         print(f"SUCCESS: memory saved with id={record.id} content='{record.content}'")
 

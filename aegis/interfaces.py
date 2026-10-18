@@ -43,6 +43,54 @@ class PermissionPolicy(Protocol):
 
 
 @dataclass(frozen=True)
+class ConfirmationToken:
+    """Cryptographically bound confirmation token for consequential actions."""
+
+    fingerprint: str
+    action: str
+    target: str | None = None
+    created_at: str = ""
+    comment: str = ""
+
+    @classmethod
+    def create(cls, request: PermissionRequest, comment: str = "") -> "ConfirmationToken":
+        from datetime import datetime, timezone
+        fp = compute_request_fingerprint(request)
+        ts = datetime.now(timezone.utc).isoformat()
+        return cls(
+            fingerprint=fp,
+            action=request.action,
+            target=request.target,
+            created_at=ts,
+            comment=comment,
+        )
+
+    def is_valid_for(self, request: PermissionRequest) -> bool:
+        if self.action != request.action:
+            return False
+        return self.fingerprint == compute_request_fingerprint(request)
+
+
+def compute_request_fingerprint(request: PermissionRequest) -> str:
+    """Compute a deterministic SHA-256 fingerprint for a PermissionRequest."""
+    import hashlib
+    import json
+
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, (set, frozenset, tuple)):
+            return list(obj)
+        return str(obj)
+
+    params_json = json.dumps(
+        dict(sorted(request.parameters.items())),
+        sort_keys=True,
+        default=_json_default,
+    )
+    raw = f"{request.action}|{request.target or ''}|{params_json}|{request.consequential}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
 class MemoryRecord:
     """A persisted memory entry."""
 

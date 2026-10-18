@@ -8,6 +8,7 @@ from aegis.audit import InMemoryAuditLogger
 from aegis.errors import PermissionDenied, ToolError
 from aegis.interfaces import (
     AuditEvent,
+    ConfirmationToken,
     Decision,
     MemoryRecord,
     MemoryStore,
@@ -135,14 +136,26 @@ class TestToolRegistry(unittest.TestCase):
         self.assertEqual(ctx.exception.result.decision, Decision.REQUIRE_CONFIRMATION)
         self.assertEqual(ctx.exception.result.rule, "confirm.shell")
 
-        # Confirmed -> handler raises ToolError("shell execution is disabled")
-        with self.assertRaises(ToolError) as ctx_tool:
+        # Bare confirm=True is rejected -> raises PermissionDenied
+        with self.assertRaises(PermissionDenied):
             self.registry.execute(
                 "run_shell",
                 {"command": "id"},
                 policy=permissive_policy,
                 audit=self.audit,
                 confirm=True,
+            )
+
+        # Confirmed with valid token -> handler raises ToolError("shell execution is disabled")
+        req = PermissionRequest(action="shell.exec", parameters={"command": "id"}, consequential=True)
+        token = ConfirmationToken.create(req)
+        with self.assertRaises(ToolError) as ctx_tool:
+            self.registry.execute(
+                "run_shell",
+                {"command": "id"},
+                policy=permissive_policy,
+                audit=self.audit,
+                confirm=token,
             )
         self.assertIn("shell execution is disabled", str(ctx_tool.exception))
 
@@ -168,25 +181,42 @@ class TestToolRegistry(unittest.TestCase):
         self.assertEqual(self.audit.events[0].event, "tool.request")
         self.assertEqual(self.audit.events[0].decision, "require_confirmation")
 
-        # 2. Confirmed attempt -> succeeds
+        # 2. Bare confirm=True attempt -> raises PermissionDenied
+        with self.assertRaises(PermissionDenied):
+            self.registry.execute(
+                "save_memory",
+                {"content": "AEGIS safety core online", "tags": ["core", "safety"]},
+                policy=self.policy,
+                audit=self.audit,
+                confirm=True,
+            )
+
+        # 3. Confirmed attempt with valid ConfirmationToken -> succeeds
+        req = PermissionRequest(
+            action="mem.save",
+            parameters={"content": "AEGIS safety core online", "tags": ["core", "safety"]},
+            consequential=True,
+        )
+        token = ConfirmationToken.create(req)
         record = self.registry.execute(
             "save_memory",
             {"content": "AEGIS safety core online", "tags": ["core", "safety"]},
             policy=self.policy,
             audit=self.audit,
-            confirm=True,
+            confirm=token,
         )
         self.assertIsInstance(record, MemoryRecord)
         self.assertEqual(record.content, "AEGIS safety core online")
         self.assertEqual(record.tags, ("core", "safety"))
 
-        # Verify audit events: previous 1 + 2 new (tool.request + tool.result)
-        self.assertEqual(len(self.audit.events), 3)
-        self.assertEqual(self.audit.events[1].event, "tool.request")
-        self.assertEqual(self.audit.events[1].decision, "require_confirmation")
-        self.assertEqual(self.audit.events[2].event, "tool.result")
-        self.assertEqual(self.audit.events[2].outcome, "success")
-        self.assertEqual(self.audit.events[2].details["tool"], "save_memory")
+        # Verify audit events: previous unconfirmed + bare confirm + token request + token result
+        last_request = self.audit.events[-2]
+        last_result = self.audit.events[-1]
+        self.assertEqual(last_request.event, "tool.request")
+        self.assertEqual(last_request.decision, "require_confirmation")
+        self.assertEqual(last_result.event, "tool.result")
+        self.assertEqual(last_result.outcome, "success")
+        self.assertEqual(last_result.details["tool"], "save_memory")
 
     def test_search_memory_tool(self) -> None:
         """Verify search_memory executes as safe read-only action."""
@@ -216,13 +246,25 @@ class TestToolRegistry(unittest.TestCase):
                 confirm=False,
             )
 
-        # With confirmation -> deleted
+        # With bare confirm=True -> denied
+        with self.assertRaises(PermissionDenied):
+            self.registry.execute(
+                "delete_memory",
+                {"id": rec.id},
+                policy=self.policy,
+                audit=self.audit,
+                confirm=True,
+            )
+
+        # With valid ConfirmationToken -> deleted
+        req = PermissionRequest(action="mem.delete", parameters={"id": rec.id}, consequential=True)
+        token = ConfirmationToken.create(req)
         deleted = self.registry.execute(
             "delete_memory",
             {"id": rec.id},
             policy=self.policy,
             audit=self.audit,
-            confirm=True,
+            confirm=token,
         )
         self.assertTrue(deleted)
         self.assertIsNone(self.mock_memory.get(rec.id))
@@ -235,13 +277,15 @@ class TestToolRegistry(unittest.TestCase):
             empty_reg.execute("search_memory", {"query": "test"}, policy=self.policy, audit=self.audit)
         self.assertIn("Memory store is not available", str(ctx.exception))
 
+        req = PermissionRequest(action="mem.save", parameters={"content": "test"}, consequential=True)
+        token = ConfirmationToken.create(req)
         with self.assertRaises(ToolError) as ctx2:
             empty_reg.execute(
                 "save_memory",
                 {"content": "test"},
                 policy=self.policy,
                 audit=self.audit,
-                confirm=True,
+                confirm=token,
             )
         self.assertIn("Memory store is not available", str(ctx2.exception))
 
@@ -328,6 +372,48 @@ class TestToolRegistry(unittest.TestCase):
         self.assertEqual(last_event.event, "tool.result")
         self.assertEqual(last_event.outcome, "error")
         self.assertEqual(last_event.details["error_type"], "ValueError")
+
+    def test_conflicting_target_and_url_parameters(self) -> None:
+        """Verify conflicting target and url parameters raise ToolError without network call (B1)."""
+        with self.assertRaises(ToolError) as ctx:
+            self.registry.execute(
+                "fetch_url",
+                {"target": "http://127.0.0.1:8080/api", "url": "https://example.com/api"},
+                policy=self.policy,
+                audit=self.audit,
+            )
+        self.assertIn("Conflicting 'target' and 'url'", str(ctx.exception))
+
+    def test_fetch_url_blocks_redirect_to_remote(self) -> None:
+        """Verify loopback server redirecting to remote URL is blocked by security policy (B2)."""
+        import http.server
+        import socketserver
+        import threading
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "https://example.com/exfiltrate")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), RedirectHandler) as httpd:
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.handle_request)
+            t.daemon = True
+            t.start()
+
+            with self.assertRaises(ToolError) as ctx:
+                self.registry.execute(
+                    "fetch_url",
+                    {"url": f"http://127.0.0.1:{port}/redirect"},
+                    policy=self.policy,
+                    audit=self.audit,
+                )
+            self.assertIn("redirect", str(ctx.exception).lower())
+            t.join(timeout=2.0)
 
 
 if __name__ == "__main__":

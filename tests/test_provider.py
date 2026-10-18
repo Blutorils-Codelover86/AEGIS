@@ -192,6 +192,45 @@ class TestOllamaProvider(unittest.TestCase):
         mock_urlopen.return_value = _MockHTTPResponse(b"{}", status=503)
         self.assertFalse(self.provider.health())
 
+    def test_non_loopback_host_rejected_by_default(self) -> None:
+        """Verify non-loopback Ollama host is rejected when network is disabled (M2)."""
+        with self.assertRaises(ProviderError) as ctx:
+            OllamaProvider(host="http://remote-ollama.example.com:11434", default_model="m", allow_network=False)
+        self.assertIn("rejected: network access is disabled", str(ctx.exception))
+
+    def test_non_loopback_host_permitted_when_allow_network(self) -> None:
+        """Verify non-loopback host is permitted when allow_network=True."""
+        p = OllamaProvider(host="http://remote-ollama.example.com:11434", default_model="m", allow_network=True)
+        self.assertEqual(p.host, "http://remote-ollama.example.com:11434")
+
+    def test_provider_blocks_redirect(self) -> None:
+        """Verify provider HTTP request blocks 3xx redirects (M2)."""
+        import http.server
+        import socketserver
+        import threading
+
+        class RedirectHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:11434/api/generate2")
+                self.end_headers()
+
+            def log_message(self, format, *args):
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), RedirectHandler) as httpd:
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.handle_request)
+            t.daemon = True
+            t.start()
+
+            p = OllamaProvider(host=f"http://127.0.0.1:{port}", default_model="m")
+            with self.assertRaises(ProviderError) as ctx:
+                p.generate("test")
+            self.assertIn("redirect", str(ctx.exception).lower())
+            t.join(timeout=2.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

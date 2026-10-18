@@ -13,10 +13,44 @@ from typing import Any, Sequence
 
 from aegis.audit import JsonlAuditLogger, read_events
 from aegis.config import AegisConfig, ensure_dirs
-from aegis.errors import AegisError, MemoryStoreError
+from aegis.errors import AegisError, MemoryStoreError, StopRequested
 from aegis.interfaces import AuditEvent, MemoryRecord, ModelProvider
 from aegis.provider.ollama import OllamaProvider
 from aegis.stop import StopController
+
+
+def _redact_url_credentials(url: str) -> str:
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            netloc = f"[REDACTED]@{netloc}"
+            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+    return url
+
+
+def _redact_argv_for_audit(argv: list[str]) -> list[str]:
+    """Redact prompts, memory text, and URL credentials from CLI arguments for auditing."""
+    redacted: list[str] = []
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in {"--prompt", "--system"} and i + 1 < len(argv):
+            redacted.append(arg)
+            redacted.append(f"[REDACTED len={len(argv[i+1])}]")
+            skip_next = True
+        elif len(redacted) >= 2 and redacted[-2] == "memory" and redacted[-1] == "save":
+            redacted.append(f"[REDACTED len={len(arg)}]")
+        else:
+            redacted.append(_redact_url_credentials(arg))
+    return redacted
 
 
 class _FallbackSQLiteMemoryStore:
@@ -92,12 +126,13 @@ class _FallbackSQLiteMemoryStore:
         results: list[MemoryRecord] = []
         q_lower = q.lower()
         for r_id, content, tags_json, source, created_at in rows:
-            if q_lower in content.lower() or q_lower in tags_json.lower():
-                try:
-                    loaded_tags = json.loads(tags_json)
-                    tag_tuple = tuple(loaded_tags) if isinstance(loaded_tags, list) else ()
-                except Exception:
-                    tag_tuple = ()
+            try:
+                loaded_tags = json.loads(tags_json)
+                tag_tuple = tuple(loaded_tags) if isinstance(loaded_tags, list) else ()
+            except Exception:
+                tag_tuple = ()
+            tag_match = any(q_lower in t.lower() for t in tag_tuple)
+            if q_lower in content.lower() or tag_match:
                 results.append(
                     MemoryRecord(
                         id=r_id,
@@ -110,6 +145,16 @@ class _FallbackSQLiteMemoryStore:
                 if len(results) >= limit:
                     break
         return results
+
+    def count(self) -> int:
+        with self._lock:
+            try:
+                cur = self._conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM memories")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+            except sqlite3.Error as e:
+                raise MemoryStoreError(f"Failed to count memories: {e}") from e
 
     def get(self, record_id: str) -> MemoryRecord | None:
         with self._lock:
@@ -281,11 +326,16 @@ def main(
         return int(e.code) if isinstance(e.code, int) else 2
 
     if provider is None:
-        provider = OllamaProvider(config.ollama_host, config.model, config.request_timeout)
+        provider = OllamaProvider(
+            config.ollama_host,
+            config.model,
+            config.request_timeout,
+            allow_network=config.allow_network,
+        )
 
     audit = JsonlAuditLogger(config.audit_log)
     try:
-        # Audit the invocation
+        # Audit the invocation with redaction
         action_name = args.subcommand
         if action_name == "memory" and getattr(args, "memory_action", None):
             action_name = f"memory.{args.memory_action}"
@@ -294,7 +344,7 @@ def main(
                 event="cli.command",
                 actor="user",
                 action=action_name,
-                details={"argv": effective_argv},
+                details={"argv": _redact_argv_for_audit(effective_argv)},
             )
         )
 
@@ -321,14 +371,29 @@ def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: A
     stop_ctrl = StopController(config.stop_file)
 
     if args.prompt is not None:
-        stop_ctrl.check()
-        answer = provider.generate(
-            args.prompt,
-            system=args.system,
-            model=args.model,
-        )
-        print(answer)
-        return 0
+        try:
+            stop_ctrl.check()
+            try:
+                answer = provider.generate(
+                    args.prompt,
+                    system=args.system,
+                    model=args.model,
+                    stop_check=stop_ctrl.check,
+                )
+            except TypeError:
+                answer = provider.generate(
+                    args.prompt,
+                    system=args.system,
+                    model=args.model,
+                )
+            print(answer)
+            return 0
+        except KeyboardInterrupt:
+            print("\n[Stop requested by user]")
+            return 130
+        except StopRequested as e:
+            print(f"\n[Operation stopped: {e}]", file=sys.stderr)
+            return 130
 
     # Interactive REPL
     max_turns = args.max_turns if args.max_turns is not None else config.max_chat_turns
@@ -351,13 +416,24 @@ def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: A
 
             turn += 1
             try:
-                response = provider.generate(
-                    stripped,
-                    system=args.system,
-                    model=args.model,
-                )
+                try:
+                    response = provider.generate(
+                        stripped,
+                        system=args.system,
+                        model=args.model,
+                        stop_check=stop_ctrl.check,
+                    )
+                except TypeError:
+                    response = provider.generate(
+                        stripped,
+                        system=args.system,
+                        model=args.model,
+                    )
             except KeyboardInterrupt:
                 print("\n[Stop requested by user]")
+                return 130
+            except StopRequested as e:
+                print(f"\n[Operation stopped: {e}]", file=sys.stderr)
                 return 130
 
             print(response)
@@ -383,7 +459,10 @@ def _handle_status(*, provider: ModelProvider, config: AegisConfig) -> int:
         try:
             store = _get_memory_store(config.memory_db)
             try:
-                count = len(store.list(limit=1000000))
+                if hasattr(store, "count"):
+                    count = store.count()
+                else:
+                    count = len(store.list(limit=config.max_memory_results))
             finally:
                 store.close()
         except Exception:
@@ -422,6 +501,7 @@ def _handle_memory(args: argparse.Namespace, *, config: AegisConfig) -> int:
             return 0
         elif args.memory_action == "search":
             limit = args.limit if args.limit is not None else config.max_memory_results
+            limit = min(max(1, limit), config.max_memory_results)
             records = store.search(args.query, limit=limit)
             if not records:
                 print("No memories found.")
@@ -432,7 +512,8 @@ def _handle_memory(args: argparse.Namespace, *, config: AegisConfig) -> int:
                     print(f"[{r.id}] {r.content}{tag_str}{src_str}")
             return 0
         elif args.memory_action == "list":
-            limit = args.limit if args.limit is not None else 50
+            limit = args.limit if args.limit is not None else config.max_memory_results
+            limit = min(max(1, limit), config.max_memory_results)
             records = store.list(limit=limit)
             if not records:
                 print("No memories stored.")

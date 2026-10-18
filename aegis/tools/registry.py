@@ -1,6 +1,7 @@
 """Tool registry and execution engine for Project AEGIS."""
 from __future__ import annotations
 
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
@@ -9,11 +10,65 @@ from aegis.errors import AegisError, PermissionDenied, ToolError
 from aegis.interfaces import (
     AuditEvent,
     AuditLogger,
+    ConfirmationToken,
     Decision,
     MemoryStore,
     PermissionPolicy,
     PermissionRequest,
 )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Custom redirect handler that blocks all HTTP redirects to enforce boundaries."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise ToolError(f"HTTP redirect ({code}) blocked by security policy")
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        raise ToolError(f"HTTP redirect ({code}) blocked by security policy")
+
+    def http_error_303(self, req, fp, code, msg, headers):
+        raise ToolError(f"HTTP redirect ({code}) blocked by security policy")
+
+    def http_error_307(self, req, fp, code, msg, headers):
+        raise ToolError(f"HTTP redirect ({code}) blocked by security policy")
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        raise ToolError(f"HTTP redirect ({code}) blocked by security policy")
+
+
+def _redact_url_credentials(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            netloc = f"[REDACTED]@{netloc}"
+            return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+    return url
+
+
+def _redact_params_for_audit(params: Mapping[str, Any]) -> dict[str, Any]:
+    redacted = {}
+    sensitive_keys = {"content", "text", "prompt", "message", "secret", "password", "token", "key"}
+    for k, v in params.items():
+        k_lower = str(k).lower()
+        if k_lower in sensitive_keys:
+            if isinstance(v, str):
+                redacted[k] = f"[REDACTED len={len(v)}]"
+            else:
+                redacted[k] = "[REDACTED]"
+        elif k_lower in {"url", "target"}:
+            redacted[k] = _redact_url_credentials(str(v))
+        else:
+            redacted[k] = v
+    return redacted
 
 
 def _default_tool_handler(params: Mapping[str, Any]) -> Any:
@@ -57,21 +112,36 @@ class ToolRegistry:
         policy: PermissionPolicy,
         audit: AuditLogger,
         actor: str = "agent",
-        confirm: bool = False,
+        confirm: ConfirmationToken | bool | None = None,
     ) -> Any:
         """Evaluate permission, audit, and execute a registered tool."""
         spec = self.get(name)
         if spec is None:
             raise ToolError(f"Unknown tool: '{name}'")
 
-        parameters: Mapping[str, Any] = params if params is not None else {}
+        raw_parameters: Mapping[str, Any] = params if params is not None else {}
+        parameters = dict(raw_parameters)
+
+        # Validate conflicting target and url parameters (B1)
+        has_target = "target" in parameters and parameters["target"] is not None
+        has_url = "url" in parameters and parameters["url"] is not None
         target: str | None = None
-        if "target" in parameters and parameters["target"] is not None:
+
+        if has_target and has_url:
+            if str(parameters["target"]) != str(parameters["url"]):
+                raise ToolError("Conflicting 'target' and 'url' parameters provided")
             target = str(parameters["target"])
-        elif "url" in parameters and parameters["url"] is not None:
+        elif has_target:
+            target = str(parameters["target"])
+        elif has_url:
             target = str(parameters["url"])
         elif "path" in parameters and parameters["path"] is not None:
             target = str(parameters["path"])
+
+        # Pass canonical URL to both target and url in parameters
+        if target is not None and (has_target or has_url):
+            parameters["target"] = target
+            parameters["url"] = target
 
         request = PermissionRequest(
             action=spec.action,
@@ -82,7 +152,7 @@ class ToolRegistry:
 
         perm_result = policy.evaluate(request)
 
-        # Audit tool request evaluation
+        # Audit tool request evaluation with parameter and credential redaction (m3)
         audit.log(
             AuditEvent(
                 event="tool.request",
@@ -93,8 +163,8 @@ class ToolRegistry:
                     "tool": name,
                     "rule": perm_result.rule,
                     "reason": perm_result.reason,
-                    "params": dict(parameters),
-                    "confirm": confirm,
+                    "params": _redact_params_for_audit(parameters),
+                    "confirm": confirm.fingerprint if isinstance(confirm, ConfirmationToken) else bool(confirm),
                 },
             )
         )
@@ -102,8 +172,11 @@ class ToolRegistry:
         if perm_result.decision == Decision.DENY:
             raise PermissionDenied(perm_result)
 
-        if perm_result.decision == Decision.REQUIRE_CONFIRMATION and not confirm:
-            raise PermissionDenied(perm_result)
+        # M1: Confirmation must not be a bare caller-supplied confirm=True.
+        # It requires a trusted ConfirmationToken whose fingerprint binds to the exact PermissionRequest.
+        if perm_result.decision == Decision.REQUIRE_CONFIRMATION:
+            if not isinstance(confirm, ConfirmationToken) or not confirm.is_valid_for(request):
+                raise PermissionDenied(perm_result)
 
         try:
             result = spec.handler(parameters)
@@ -180,8 +253,11 @@ def default_registry(memory: MemoryStore | None = None) -> ToolRegistry:
             raise ToolError("URL parameter is required")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "AEGIS/0.1.0"})
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            with opener.open(req, timeout=5.0) as resp:
                 return resp.read().decode("utf-8", errors="replace")
+        except ToolError:
+            raise
         except Exception as exc:
             raise ToolError(f"HTTP request to '{url}' failed: {exc}") from exc
 

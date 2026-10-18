@@ -159,20 +159,39 @@ class TestDeterministicPolicy(unittest.TestCase):
                 self.assertEqual(ctx.exception.result.rule, "deny.network")
 
     def test_net_http_non_loopback_approved_when_allowed(self) -> None:
-        """Verify non-loopback net.http yields ALLOW with net.approved if allow_network is set."""
+        """Verify non-loopback net.http yields REQUIRE_CONFIRMATION with confirm.network if allow_network is set."""
         # Via AegisConfig
         cfg = AegisConfig(allow_network=True)
         policy_cfg = DeterministicPolicy(cfg)
         req = PermissionRequest(action="net.http", target="http://example.com/api")
         res = policy_cfg.evaluate(req)
-        self.assertEqual(res.decision, Decision.ALLOW)
-        self.assertEqual(res.rule, "net.approved")
+        self.assertEqual(res.decision, Decision.REQUIRE_CONFIRMATION)
+        self.assertEqual(res.rule, "confirm.network")
 
         # Via kwarg
         policy_kwarg = DeterministicPolicy(allow_network=True)
         res2 = policy_kwarg.evaluate(req)
-        self.assertEqual(res2.decision, Decision.ALLOW)
-        self.assertEqual(res2.rule, "net.approved")
+        self.assertEqual(res2.decision, Decision.REQUIRE_CONFIRMATION)
+        self.assertEqual(res2.rule, "confirm.network")
+
+    def test_high_risk_actions_never_auto_allowed(self) -> None:
+        """Verify high-risk actions (shell.exec, fs.read_private, net.http) cannot be auto-allowed."""
+        permissive = DeterministicPolicy(
+            allow_consequential=True,
+            allow_shell=True,
+            allow_private_files=True,
+            allow_network=True,
+        )
+        high_risk_requests = [
+            PermissionRequest(action="shell.exec", parameters={"cmd": "ls"}),
+            PermissionRequest(action="fs.read_private", target="~/.ssh/id_rsa"),
+            PermissionRequest(action="net.http", target="http://example.com/api"),
+        ]
+        for req in high_risk_requests:
+            with self.subTest(action=req.action):
+                res = permissive.evaluate(req)
+                self.assertNotEqual(res.decision, Decision.ALLOW)
+                self.assertEqual(res.decision, Decision.REQUIRE_CONFIRMATION)
 
     def test_consequential_actions_require_confirmation_by_default(self) -> None:
         """Verify consequential actions require confirmation by default."""

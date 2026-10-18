@@ -151,11 +151,15 @@ class DeterministicPolicy:
         if action == "net.http":
             target = request.target
             if not target and isinstance(request.parameters, Mapping):
-                target = (
-                    request.parameters.get("url")
-                    or request.parameters.get("target")
-                    or request.parameters.get("host")
-                )
+                url_param = request.parameters.get("url")
+                tgt_param = request.parameters.get("target")
+                if url_param is not None and tgt_param is not None and str(url_param) != str(tgt_param):
+                    return PermissionResult(
+                        decision=Decision.DENY,
+                        reason="Conflicting url and target parameters",
+                        rule="deny.conflicting_target",
+                    )
+                target = url_param or tgt_param or request.parameters.get("host")
 
             if _is_loopback(str(target) if target is not None else None):
                 return PermissionResult(
@@ -164,10 +168,11 @@ class DeterministicPolicy:
                     rule="net.loopback",
                 )
             if self.allow_network:
+                # Non-loopback network is high-risk: requires confirmation even when network is enabled
                 return PermissionResult(
-                    decision=Decision.ALLOW,
-                    reason="Non-loopback network access approved by configuration",
-                    rule="net.approved",
+                    decision=Decision.REQUIRE_CONFIRMATION,
+                    reason="Non-loopback network access approved by configuration requires confirmation",
+                    rule="confirm.network",
                 )
             return PermissionResult(
                 decision=Decision.DENY,
@@ -177,7 +182,9 @@ class DeterministicPolicy:
 
         # 5. Consequential actions
         if action in self.CONSEQUENTIAL_ACTIONS:
-            if self.allow_consequential:
+            # High-risk actions must NEVER be auto-allowed by global config flags
+            high_risk = {"shell.exec", "fs.read_private", "net.http"}
+            if self.allow_consequential and action not in high_risk:
                 return PermissionResult(
                     decision=Decision.ALLOW,
                     reason=f"Consequential action '{action}' auto-allowed by configuration",
