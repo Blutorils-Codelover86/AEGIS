@@ -1,1 +1,4 @@
-"""Command-line interface subpackage for Project AEGIS."""
+"""CLI subpackage for Project AEGIS."""
+from aegis.cli.main import main
+
+__all__ = ["main"]
