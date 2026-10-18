@@ -309,62 +309,63 @@ def main(
     config: AegisConfig | None = None,
 ) -> int:
     """Main CLI entrypoint for AEGIS."""
-    if config is None:
-        config = AegisConfig.load()
-    ensure_dirs(config)
-
-    effective_argv = list(sys.argv[1:] if argv is None else argv)
-    if not effective_argv:
-        parser = _build_parser()
-        parser.print_help()
-        return 2
-
-    parser = _build_parser()
     try:
-        args = parser.parse_args(effective_argv)
-    except SystemExit as e:
-        return int(e.code) if isinstance(e.code, int) else 2
+        if config is None:
+            config = AegisConfig.load()
+        ensure_dirs(config)
 
-    if provider is None:
-        provider = OllamaProvider(
-            config.ollama_host,
-            config.model,
-            config.request_timeout,
-            allow_network=config.allow_network,
-        )
-
-    audit = JsonlAuditLogger(config.audit_log)
-    try:
-        # Audit the invocation with redaction
-        action_name = args.subcommand
-        if action_name == "memory" and getattr(args, "memory_action", None):
-            action_name = f"memory.{args.memory_action}"
-        audit.log(
-            AuditEvent(
-                event="cli.command",
-                actor="user",
-                action=action_name,
-                details={"argv": _redact_argv_for_audit(effective_argv)},
-            )
-        )
-
-        # Dispatch command
-        if args.subcommand == "chat":
-            return _handle_chat(args, provider=provider, config=config)
-        elif args.subcommand == "status":
-            return _handle_status(provider=provider, config=config)
-        elif args.subcommand == "memory":
-            return _handle_memory(args, config=config)
-        elif args.subcommand == "stop":
-            return _handle_stop(args, config=config)
-        else:
-            sys.stderr.write(f"Unknown subcommand: {args.subcommand}\n")
+        effective_argv = list(sys.argv[1:] if argv is None else argv)
+        if not effective_argv:
+            parser = _build_parser()
+            parser.print_help()
             return 2
+
+        parser = _build_parser()
+        try:
+            args = parser.parse_args(effective_argv)
+        except SystemExit as e:
+            return int(e.code) if isinstance(e.code, int) else 2
+
+        if provider is None:
+            provider = OllamaProvider(
+                config.ollama_host,
+                config.model,
+                config.request_timeout,
+                allow_network=config.allow_network,
+            )
+
+        audit = JsonlAuditLogger(config.audit_log)
+        try:
+            # Audit the invocation with redaction
+            action_name = args.subcommand
+            if action_name == "memory" and getattr(args, "memory_action", None):
+                action_name = f"memory.{args.memory_action}"
+            audit.log(
+                AuditEvent(
+                    event="cli.command",
+                    actor="user",
+                    action=action_name,
+                    details={"argv": _redact_argv_for_audit(effective_argv)},
+                )
+            )
+
+            # Dispatch command
+            if args.subcommand == "chat":
+                return _handle_chat(args, provider=provider, config=config)
+            elif args.subcommand == "status":
+                return _handle_status(provider=provider, config=config)
+            elif args.subcommand == "memory":
+                return _handle_memory(args, config=config)
+            elif args.subcommand == "stop":
+                return _handle_stop(args, config=config)
+            else:
+                sys.stderr.write(f"Unknown subcommand: {args.subcommand}\n")
+                return 2
+        finally:
+            audit.close()
     except AegisError as e:
         sys.stderr.write(f"Error: {e}\n")
         return 2
-    finally:
-        audit.close()
 
 
 def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: AegisConfig) -> int:

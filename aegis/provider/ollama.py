@@ -161,6 +161,10 @@ class OllamaProvider:
         except StopRequested:
             raise
         except urllib.error.HTTPError as e:
+            try:
+                e.close()
+            except Exception:
+                pass
             msg = f"Ollama HTTP error {e.code}: {e.reason}"
             self._last_error = msg
             raise ProviderError(msg) from e
@@ -223,6 +227,10 @@ class OllamaProvider:
             with self._open(req, timeout=self.timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as e:
+            try:
+                e.close()
+            except Exception:
+                pass
             msg = f"Ollama HTTP error {e.code}: {e.reason}"
             self._last_error = msg
             raise ProviderError(msg) from e

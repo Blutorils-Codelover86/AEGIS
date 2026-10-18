@@ -270,6 +270,23 @@ class TestCLI(unittest.TestCase):
         finally:
             store.close()
 
+    def test_non_loopback_host_cli_error_clean_exit(self) -> None:
+        """Verify main() catches AegisError during provider init, writes to stderr, and exits code 2."""
+        bad_config = AegisConfig(
+            ollama_host="http://example.com:11434",
+            allow_network=False,
+            memory_db=self.db_path,
+            audit_log=self.audit_path,
+            stop_file=self.stop_path,
+        )
+        err = io.StringIO()
+        with redirect_stderr(err):
+            rc = main(["status"], config=bad_config)
+        self.assertEqual(rc, 2)
+        err_msg = err.getvalue()
+        self.assertIn("Error: Non-loopback Ollama host 'http://example.com:11434' rejected", err_msg)
+        self.assertNotIn("Traceback", err_msg)
+
 
 if __name__ == "__main__":
     unittest.main()

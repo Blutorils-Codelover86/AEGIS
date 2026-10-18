@@ -24,6 +24,7 @@ class TestMemoryStore(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.store.close()
+        self.assertIsNone(self.store._conn)
         self.temp_dir.cleanup()
 
     def test_protocol_conformance(self) -> None:
@@ -157,8 +158,8 @@ class TestMemoryStore(unittest.TestCase):
 
         # Close and reopen store, verify persistence and tags
         self.store.close()
-        reopened = open_memory(self.db_path)
-        try:
+        self.assertIsNone(self.store._conn)
+        with open_memory(self.db_path) as reopened:
             persisted_all = reopened.list(limit=50)
             self.assertEqual(len(persisted_all), 3)
 
@@ -171,8 +172,7 @@ class TestMemoryStore(unittest.TestCase):
             persisted_r2 = reopened.get(r2.id)
             self.assertIsNotNone(persisted_r2)
             self.assertEqual(persisted_r2.tags, ("tag2", "common"))
-        finally:
-            reopened.close()
+        self.assertIsNone(reopened._conn)
 
     def test_empty_content_raises_error(self) -> None:
         """empty or whitespace content raises MemoryStoreError."""
@@ -185,9 +185,11 @@ class TestMemoryStore(unittest.TestCase):
     def test_close_is_idempotent_and_operations_fail_after_close(self) -> None:
         """close() is idempotent and operations after close raise MemoryStoreError."""
         self.store.close()
+        self.assertIsNone(self.store._conn)
         # Additional close calls should not raise
         self.store.close()
         self.store.close()
+        self.assertIsNone(self.store._conn)
 
         # Any operation after close must raise MemoryStoreError
         with self.assertRaises(MemoryStoreError):
@@ -214,23 +216,19 @@ class TestMemoryStore(unittest.TestCase):
         nested_path = os.path.join(nested_dir, "nested_memory.db")
         self.assertFalse(os.path.exists(nested_dir))
 
-        store = SQLiteMemoryStore(nested_path)
-        try:
+        with SQLiteMemoryStore(nested_path) as store:
             self.assertTrue(os.path.isdir(nested_dir))
             rec = store.save("Nested db test")
             self.assertEqual(store.get(rec.id).content, "Nested db test")
-        finally:
-            store.close()
+        self.assertIsNone(store._conn)
 
     def test_in_memory_database(self) -> None:
         """SQLiteMemoryStore supports in-memory databases with ':memory:'."""
-        mem_store = SQLiteMemoryStore(":memory:")
-        try:
+        with SQLiteMemoryStore(":memory:") as mem_store:
             rec = mem_store.save("In-memory record", tags=("transient",))
             self.assertEqual(mem_store.get(rec.id), rec)
             self.assertEqual(len(mem_store.search("transient")), 1)
-        finally:
-            mem_store.close()
+        self.assertIsNone(mem_store._conn)
 
     def test_context_manager(self) -> None:
         """SQLiteMemoryStore works as a context manager."""
@@ -238,6 +236,7 @@ class TestMemoryStore(unittest.TestCase):
         with open_memory(cm_path) as s:
             rec = s.save("Context manager test")
             self.assertIsNotNone(s.get(rec.id))
+        self.assertIsNone(s._conn)
         # After exit, store should be closed
         with self.assertRaises(MemoryStoreError):
             s.save("Should fail")
@@ -310,12 +309,17 @@ class TestMemoryStore(unittest.TestCase):
 
         # memory_row_factory
         conn = sqlite3.connect(":memory:")
-        cur = conn.execute("SELECT 'id3' AS id, 'content3' AS content, '[\"tag3\"]' AS tags, NULL AS source, '2026-01-03T00:00:00+00:00' AS created_at")
-        raw_row = cur.fetchone()
-        rec3 = memory_row_factory(cur, raw_row)
-        self.assertEqual(rec3.id, "id3")
-        self.assertEqual(rec3.tags, ("tag3",))
-        conn.close()
+        try:
+            cur = conn.execute("SELECT 'id3' AS id, 'content3' AS content, '[\"tag3\"]' AS tags, NULL AS source, '2026-01-03T00:00:00+00:00' AS created_at")
+            try:
+                raw_row = cur.fetchone()
+                rec3 = memory_row_factory(cur, raw_row)
+                self.assertEqual(rec3.id, "id3")
+                self.assertEqual(rec3.tags, ("tag3",))
+            finally:
+                cur.close()
+        finally:
+            conn.close()
 
     def test_search_punctuation_and_escaped_tags(self) -> None:
         """Verify search against JSON structural punctuation does not falsely match (m1)."""

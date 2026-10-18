@@ -91,13 +91,15 @@ class TestOllamaProvider(unittest.TestCase):
 
     @patch("urllib.request.urlopen")
     def test_generate_http_error(self, mock_urlopen: MagicMock) -> None:
-        mock_urlopen.side_effect = urllib.error.HTTPError(
+        http_err = urllib.error.HTTPError(
             url="http://127.0.0.1:11434/api/generate",
             code=500,
             msg="Internal Server Error",
             hdrs=MagicMock(),
             fp=io.BytesIO(b"server crashed"),
         )
+        self.addCleanup(http_err.close)
+        mock_urlopen.side_effect = http_err
         with self.assertRaises(ProviderError) as ctx:
             self.provider.generate("hi")
         self.assertIn("500", str(ctx.exception))
