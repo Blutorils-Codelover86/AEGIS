@@ -102,18 +102,18 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -t . -v
 ```
 
 ```text
-Ran 103 tests in 1.933s
+Ran 104 tests in 3.028s
 
 OK
 ```
 
-All 103 tests passed cleanly across:
+All 104 tests passed cleanly across:
 - `tests/test_audit.py` (Structured JSON Lines audit logger, 0600 file permissions, strict metadata allowlist, URL query/credential redaction, tags/sources/IDs/values masking, scrubbed error strings)
 - `tests/test_config.py` (AegisConfig loading, TOML overrides, environment overrides)
 - `tests/test_stop.py` (Emergency stop controller, check/clear signals)
 - `tests/test_memory.py` (SQLiteMemoryStore persistence, decoded tag search, punctuation query handling, count(), limit capping)
 - `tests/test_cli.py` (CLI argument parser, status, memory, chat, stop subcommands, single-shot Ctrl-C exit code 130, in-flight stop interruption, clean AegisError handling, memory count display)
-- `tests/test_provider.py` (Ollama provider client, health checks, error handling, protocol adherence, non-loopback host rejection, redirect blocking, scheme enforcement, stalled stream stop interruption polling via select)
+- `tests/test_provider.py` (Ollama provider client, health checks, error handling, protocol adherence, non-loopback host rejection, redirect blocking, scheme enforcement, stalled response headers stop interruption, stalled stream stop interruption polling via select)
 - `tests/test_permissions.py` (DeterministicPolicy rules, allowlist, denial, confirmation, high-risk action non-bypassability, http/https scheme enforcement)
 - `tests/test_tools.py` (ToolRegistry execution, ApprovalAuthority integration, single-use token consumption, forgery rejection, replay rejection, conflicting target/url rejection, 302 redirect blocking, non-http scheme rejection)
 
@@ -129,6 +129,6 @@ All 103 tests passed cleanly across:
 | **4. Persists Authorized Memory** | **PASSED** | Explicit memory lifecycle demonstrated: `aegis memory save` created record `fc06ccbace294e72bcebee8ac4eaa1b1`, `aegis memory search` found it with tags and metadata, `aegis memory list` listed it, `aegis memory delete` removed it, and subsequent search confirmed `No memories found.` |
 | **5. Demonstrates Enforced Permission Denial & Single-Use Approval** | **PASSED** | `scripts/demo_permission_denial.py` demonstrated:<br>1. `run_shell` rejected with `DENIED rule=deny.shell reason=Shell execution is denied by default policy`<br>2. Unconfirmed `save_memory` rejected with `DENIED rule=consequential.confirm_required`<br>3. Bare caller `confirm=True` rejected with `DENIED (bare confirm=True rejected)`<br>4. Forged `ConfirmationToken` rejected by `ApprovalAuthority`<br>5. Legitimate `ConfirmationToken` authorized and executed<br>6. Replayed `ConfirmationToken` rejected (single-use token consumed atomically)<br>7. Structured JSONL audit records verified with strict metadata allowlist, query/credential redaction, and scrubbed error messages. |
 | **6. Gated Network Boundary & Scheme Enforcement** | **PASSED** | Non-http/https schemes (`file:`, `ftp:`, `data:`, relative URLs) strictly rejected at policy and registry boundaries; non-loopback Ollama hosts rejected by default; loopback HTTP redirect (302) to remote blocked; conflicting target/url parameters rejected with `ToolError`. |
-| **7. Interruptible Stop & Stalled Stream Polling** | **PASSED** | `StopController` interrupts generation within 0.2s even on stalled connections using non-blocking socket select polling; `KeyboardInterrupt` exits cleanly with code 130. |
+| **7. Interruptible Stop & Stalled Connection Polling** | **PASSED** | `StopController` interrupts generation within 0.2s even on stalled connections (during both initial HTTP header wait and response stream reads) using actively cancellable worker and non-blocking socket select polling; `KeyboardInterrupt` exits cleanly with code 130. |
 
 *Note: 100% of required steps executed successfully. Zero steps were blocked or skipped.*

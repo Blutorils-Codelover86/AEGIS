@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import select
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -106,6 +107,66 @@ class OllamaProvider:
     def _open(self, req: urllib.request.Request, timeout: float):
         return self._opener.open(req, timeout=timeout)
 
+    def _cancellable_open(
+        self,
+        req: urllib.request.Request,
+        *,
+        timeout: float,
+        stop_check: Callable[[], None] | None = None,
+    ) -> Any:
+        """Open an HTTP request with active stop-check cancellation during the header-wait phase."""
+        if stop_check is None:
+            return self._open(req, timeout=timeout)
+
+        stop_check()
+        open_result: list[Any] = []
+        open_exc: list[BaseException] = []
+        cancelled = threading.Event()
+
+        def open_worker() -> None:
+            try:
+                resp = self._open(req, timeout=timeout)
+                if cancelled.is_set():
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                else:
+                    open_result.append(resp)
+            except BaseException as e:
+                if not cancelled.is_set():
+                    open_exc.append(e)
+
+        t = threading.Thread(target=open_worker, daemon=True)
+        t.start()
+
+        deadline = time.monotonic() + timeout
+        try:
+            while t.is_alive():
+                stop_check()
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"Ollama request timed out after {timeout}s waiting for response headers")
+                t.join(timeout=0.1)
+
+            if stop_check is not None:
+                stop_check()
+
+            if open_exc:
+                raise open_exc[0]
+
+            if not open_result:
+                raise TimeoutError(f"Ollama request timed out after {timeout}s waiting for response headers")
+
+            return open_result[0]
+        except BaseException:
+            cancelled.set()
+            if open_result:
+                try:
+                    open_result[0].close()
+                except Exception:
+                    pass
+            raise
+
     def last_error(self) -> str | None:
         """Return the last recorded error message for diagnostics."""
         return self._last_error
@@ -144,7 +205,7 @@ class OllamaProvider:
         )
 
         try:
-            with self._open(req, timeout=self.timeout) as resp:
+            with self._cancellable_open(req, timeout=self.timeout, stop_check=stop_check) as resp:
                 if stop_check is not None and (hasattr(resp, "readline") or hasattr(resp, "__iter__")):
                     chunks: list[str] = []
                     deadline = time.monotonic() + self.timeout

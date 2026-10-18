@@ -285,6 +285,53 @@ class TestOllamaProvider(unittest.TestCase):
             self.assertLess(elapsed, 2.0, "Stop should interrupt stalled stream quickly, not wait for timeout")
             t.join(timeout=1.0)
 
+    def test_stop_during_stalled_headers(self) -> None:
+        """Verify StopRequested interrupts within ~0.2s when the server stalls on response headers (safety blocker)."""
+        import http.server
+        import socketserver
+        import threading
+        import time
+
+        class StallHeadersHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                # Accept connection and POST, but stall without sending any response headers
+                time.sleep(5)
+
+            def log_message(self, format, *args):
+                pass
+
+        with socketserver.TCPServer(("127.0.0.1", 0), StallHeadersHandler) as httpd:
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.handle_request)
+            t.daemon = True
+            t.start()
+
+            stopped = False
+
+            def stop_check():
+                if stopped:
+                    raise StopRequested("Interrupted stalled headers wait")
+
+            def trigger_stop():
+                time.sleep(0.2)
+                nonlocal stopped
+                stopped = True
+
+            threading.Thread(target=trigger_stop, daemon=True).start()
+
+            # Set timeout to 120s (default timeout); stop must interrupt well before that (assert elapsed < 2.0s)
+            provider = OllamaProvider(host=f"http://127.0.0.1:{port}", default_model="m", timeout=120.0)
+            t0 = time.monotonic()
+            with self.assertRaises(StopRequested):
+                provider.generate("test prompt", stop_check=stop_check)
+            elapsed = time.monotonic() - t0
+            self.assertLess(
+                elapsed,
+                2.0,
+                f"Stop should interrupt header stall quickly (took {elapsed:.2f}s, expected < 2.0s)",
+            )
+            t.join(timeout=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -193,13 +193,6 @@ class ToolRegistry:
 
         perm_result = policy.evaluate(request)
 
-        # B2: Trusted approval authority validation and atomic consumption
-        effective_authority = authority or self.authority
-        confirmed = False
-        if perm_result.decision == Decision.REQUIRE_CONFIRMATION:
-            if effective_authority is not None and confirm is not None and not isinstance(confirm, bool):
-                confirmed = effective_authority.consume_token(confirm, request)
-
         # Audit confirm parameter with sensitive token masking
         confirm_audit: Any = False
         if isinstance(confirm, ConfirmationToken):
@@ -209,7 +202,7 @@ class ToolRegistry:
         elif isinstance(confirm, bool):
             confirm_audit = confirm
 
-        # Audit tool request evaluation with strict parameter redaction
+        # Audit tool request evaluation with strict parameter redaction (before consuming token)
         audit.log(
             AuditEvent(
                 event="tool.request",
@@ -229,7 +222,13 @@ class ToolRegistry:
         if perm_result.decision == Decision.DENY:
             raise PermissionDenied(perm_result)
 
+        # B2: Trusted approval authority validation and atomic consumption
         if perm_result.decision == Decision.REQUIRE_CONFIRMATION:
+            effective_authority = authority or self.authority
+            confirmed = False
+            if effective_authority is not None and confirm is not None and not isinstance(confirm, bool):
+                confirmed = effective_authority.consume_token(confirm, request)
+
             if not confirmed:
                 raise PermissionDenied(
                     PermissionResult(

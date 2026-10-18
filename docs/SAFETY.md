@@ -66,7 +66,7 @@ Project AEGIS is designed around strict, non-negotiable safety principles. Safet
 - **Enforcement**:
   - `StopController` manages a local filesystem flag (`<data_dir>/STOP`).
   - `aegis stop` creates the file with a UTC timestamp; `aegis stop --clear` clears it.
-  - In-flight model generation uses non-blocking socket select polling (`select.select([fn], [], [], 0.1)`) to check `stop_ctrl.check()` every 100ms. If the stop flag appears, generation aborts immediately with `StopRequested`, rather than blocking on the 120s HTTP timeout.
+  - In-flight model generation uses an actively cancellable background worker during the initial HTTP response header-wait phase, and non-blocking socket select polling (`select.select([fn], [], [], 0.1)`) during stream read. Both poll `stop_ctrl.check()` every 100ms. If the stop flag appears, generation aborts immediately with `StopRequested`, rather than blocking on the 120s HTTP timeout.
   - In both single-shot and interactive REPL chat modes, `KeyboardInterrupt` (Ctrl+C) is caught cleanly and exits with code 130 without stack traces.
 
 ### 7. Structured Redacted Audit Logging
