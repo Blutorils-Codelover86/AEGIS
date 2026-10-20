@@ -131,4 +131,96 @@ All 104 tests passed cleanly across:
 | **6. Gated Network Boundary & Scheme Enforcement** | **PASSED** | Non-http/https schemes (`file:`, `ftp:`, `data:`, relative URLs) strictly rejected at policy and registry boundaries; non-loopback Ollama hosts rejected by default; loopback HTTP redirect (302) to remote blocked; conflicting target/url parameters rejected with `ToolError`. |
 | **7. Interruptible Stop & Stalled Connection Polling** | **PASSED** | `StopController` interrupts generation within 0.2s even on stalled connections (during both initial HTTP header wait and response stream reads) using actively cancellable worker and non-blocking socket select polling; `KeyboardInterrupt` exits cleanly with code 130. |
 
+---
+
+## 4. Sprint 002 — Terminal Core Demonstration Run
+
+The Sprint 002 terminal experience demonstration was executed using [`scripts/demo_terminal.sh`](../scripts/demo_terminal.sh):
+
+```bash
+bash scripts/demo_terminal.sh
+```
+
+### Actual Observed Output
+
+```text
+======================================================================
+Project AEGIS - Sprint 002 Rich Terminal Demonstration
+Repository: /home/blu/.ao/data/worktrees/aegis/you-are-the
+======================================================================
+
+=== Step 1: Styled Terminal Streaming (Pseudo-TTY Capture) ===
+AEGIS · qwen2.5-coder:1.5b · local
+aegis >
+Sure, here is the markdown table:                                               
+
+                      
+ Row 1      Row 2     
+ ──────────────────── 
+ Content 1  Content 2 
+                      
+▍ done · 31 chunks in 6.12s (5.1 chunks/s)
+
+=== Step 2: Plain Output (Verified Zero ANSI Escape Codes) ===
+- Red
+- Blue
+- Green
+
+=== Step 3: ANSI Escape Verification ===
+SUCCESS: --plain produced zero escape codes.
+
+=== Step 4: System Status Display ===
+Model: qwen2.5-coder:1.5b
+Ollama Host: http://127.0.0.1:11434
+Provider Health: True
+Available Models: ['gemma3:1b', 'qwen3:1.7b', 'Ultron-v1.1.0:1.5b', 
+'qwen2.5-coder:3b', 'qwen2.5-coder:1.5b']
+Memory DB: /home/blu/.local/share/aegis/memory.db (0 records)
+Audit Log: /home/blu/.local/share/aegis/audit.jsonl (last event: cli.command at 
+2026-10-20T08:18:04.424890+00:00)
+Stop State: clear
+
+======================================================================
+Sprint 002 Terminal Demonstration Complete.
+======================================================================
+```
+
+### Live Ollama Chunk Streaming Incremental Arrival Measurement
+
+Real token chunks from local Ollama are verified to arrive incrementally without fixed sleep/typewriter delays:
+
+```text
+Total chunks received: 144
+Sample chunk arrival intervals (ms):
+  Chunk 1 -> 2: 0.1 ms (',')
+  Chunk 2 -> 3: 133.1 ms ('here')
+  Chunk 3 -> 4: 136.1 ms ('are')
+  Chunk 4 -> 5: 140.3 ms ('')
+  Chunk 5 -> 6: 137.3 ms ('3')
+  Chunk 6 -> 7: 139.0 ms ('fruit')
+  Chunk 7 -> 8: 137.4 ms ('names')
+  Chunk 8 -> 9: 131.8 ms ('with')
+  Chunk 9 -> 10: 138.3 ms ('brief')
+Average interval over first samples: 121.5 ms
+Interval variance shows real dynamic LLM inference, not fixed sleep delays.
+```
+
+### Test Suite Execution Output (Sprint 002)
+
+```bash
+.venv/bin/python -W error::ResourceWarning -m unittest discover -s tests -t . -v
+```
+
+```text
+Ran 152 tests in 11.067s
+
+OK
+```
+
+All 152 tests passed cleanly (104 Sprint 001 tests + 48 Sprint 002 tests) across:
+- `tests/test_render.py` (`StreamBuffer` safe incremental markdown segmentation, pipe-free table header retention, table separator verification, embedded code fences, invalid fence closer rejection, CRLF line endings, single-character chunk streams, 500-line unclosed block buffering, `render_markdown`, `render_plain`, `safe_width` narrow terminals)
+- `tests/test_streaming.py` (`OllamaProvider.generate_stream` order, `done: true` completion, `stop_check` mid-stream interruption, loopback HTTP server error/malformed handling, delayed flush timestamp intervals, live Ollama incremental arrival timestamps, CLI single-shot streaming, no artificial typing delays)
+- `tests/test_cli_compat.py` (Preservation of all four subcommands, `--model gemma3:4b` forwarding, global `--plain` and `--no-color` before/after commands, nested memory actions, narrow terminal `COLUMNS=20`, interruption buffer flush keeping partial text with rc 130, `--plain` zero ANSI emission, `NO_COLOR` standard compliance, Ctrl+C exit code 130, `--help` output)
+- `tests/test_tui.py` (Textual optional extra guards, missing-extra install instructions, non-TTY and import failure fallback to Rich streaming, app construction, pilot headless token streaming, system prompt propagation, hostile splits `**bo`/tables/open fences with raw tail buffering, clean worker shutdown on quit during stalled stream)
+
 *Note: 100% of required steps executed successfully. Zero steps were blocked or skipped.*

@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 from aegis.errors import ProviderError, StopRequested
 
@@ -317,6 +317,144 @@ class OllamaProvider:
 
         self._last_error = None
         return result
+
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> Iterator[str]:
+        """Stream completion tokens for a prompt using Ollama."""
+        if stop_check is not None:
+            stop_check()
+
+        target_model = model or self.default_model
+        payload: dict[str, Any] = {
+            "model": target_model,
+            "prompt": prompt,
+            "system": system,
+            "stream": True,
+        }
+        if stop is not None:
+            payload["options"] = {"stop": list(stop)}
+
+        url = f"{self.host}/api/generate"
+        encoded_data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=url,
+            data=encoded_data,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+
+        try:
+            resp = self._cancellable_open(req, timeout=self.timeout, stop_check=stop_check)
+        except StopRequested:
+            raise
+        except urllib.error.HTTPError as e:
+            try:
+                e.close()
+            except Exception:
+                pass
+            msg = f"Ollama HTTP error {e.code}: {e.reason}"
+            self._last_error = msg
+            raise ProviderError(msg) from e
+        except urllib.error.URLError as e:
+            msg = f"Ollama connection error: {e.reason}"
+            self._last_error = msg
+            raise ProviderError(msg) from e
+        except TimeoutError as e:
+            msg = f"Ollama request timed out after {self.timeout}s"
+            self._last_error = msg
+            raise ProviderError(msg) from e
+        except Exception as e:
+            if isinstance(e, ProviderError):
+                raise
+            msg = f"Ollama request failed: {e}"
+            self._last_error = msg
+            raise ProviderError(msg) from e
+
+        try:
+            with resp:
+                deadline = time.monotonic() + self.timeout
+                fn: int | None = None
+                if hasattr(resp, "fileno"):
+                    try:
+                        fn = resp.fileno()
+                    except Exception:
+                        fn = None
+
+                while True:
+                    if stop_check is not None:
+                        stop_check()
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(f"Ollama stream timed out after {self.timeout}s")
+
+                    if fn is not None and fn >= 0:
+                        try:
+                            r, _, _ = select.select([fn], [], [], 0.1)
+                            if not r:
+                                continue
+                        except (io.UnsupportedOperation, OSError):
+                            fn = None
+
+                    line = resp.readline()
+                    if not line:
+                        break
+
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+
+                    try:
+                        text_data = stripped.decode("utf-8")
+                    except Exception as e:
+                        msg = f"Malformed UTF-8 response from Ollama: {e}"
+                        self._last_error = msg
+                        raise ProviderError(msg) from e
+
+                    try:
+                        data = json.loads(text_data)
+                    except Exception as e:
+                        msg = f"Malformed JSON response from Ollama: {e}"
+                        self._last_error = msg
+                        raise ProviderError(msg) from e
+
+                    if not isinstance(data, dict):
+                        msg = "Malformed response from Ollama: expected JSON object"
+                        self._last_error = msg
+                        raise ProviderError(msg)
+
+                    if "error" in data:
+                        msg = f"Ollama error: {data['error']}"
+                        self._last_error = msg
+                        raise ProviderError(msg)
+
+                    delta = data.get("response")
+                    if delta:
+                        yield str(delta)
+
+                    if data.get("done", False):
+                        break
+
+                    if stop_check is not None:
+                        stop_check()
+
+        except StopRequested:
+            raise
+        except TimeoutError as e:
+            msg = f"Ollama stream timed out after {self.timeout}s"
+            self._last_error = msg
+            raise ProviderError(msg) from e
+        except Exception as e:
+            if isinstance(e, (ProviderError, StopRequested)):
+                raise
+            msg = f"Ollama stream failed: {e}"
+            self._last_error = msg
+            raise ProviderError(msg) from e
 
     def list_models(self) -> list[str]:
         """List locally available models from Ollama."""
