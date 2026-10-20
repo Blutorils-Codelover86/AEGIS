@@ -258,7 +258,7 @@ class AegisTUI(App):
                         accum_stable += ready
                         self.call_from_thread(md_widget.update, accum_stable)
                     # Display pending tail as literal text
-                    pending = buf._buffer
+                    pending = buf.pending
                     self.call_from_thread(tail_widget.update, pending)
                     self.call_from_thread(self._scroll_history)
             else:

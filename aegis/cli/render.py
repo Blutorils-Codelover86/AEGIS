@@ -136,6 +136,11 @@ class StreamBuffer:
         self._buffer = ""
         return res
 
+    @property
+    def pending(self) -> str:
+        """Return the un-emitted trailing buffer content."""
+        return self._buffer
+
 
 def render_markdown(console: Console, text: str) -> None:
     """Render markdown text via rich.markdown.Markdown."""

@@ -191,6 +191,14 @@ class TestStreamBuffer(unittest.TestCase):
         self.assertIn("line_0 = 0\n", flushed)
         self.assertIn("line_499 = 499\n", flushed)
 
+    def test_pending_property(self) -> None:
+        """StreamBuffer.pending exposes the un-emitted trailing buffer content."""
+        self.assertEqual(self.buf.pending, "")
+        self.buf.feed("Line 1\nThis is **bo")
+        self.assertEqual(self.buf.pending, "This is **bo")
+        self.buf.feed("ld** text.\n\n")
+        self.assertEqual(self.buf.pending, "")
+
 
 if __name__ == "__main__":
     unittest.main()

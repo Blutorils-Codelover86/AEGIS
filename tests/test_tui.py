@@ -265,6 +265,74 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             self.assertIn("```python", final_source)
             self.assertIn("Final conclusion.", final_source)
 
+    async def test_pilot_delayed_chunks_intermediate_tail_states(self) -> None:
+        """Incomplete **bo, open fence, and table stay in literal pending tail until completed."""
+        import threading
+        chunks = [
+            "Intro.\n\nThis is **bo",
+            "ld** text.\n\n",
+            "| Col 1 | Col 2 |\n|---|---|\n",
+            "| Val 1 | Val 2 |\n\n",
+            "````\n```python\nx = 10\n",
+            "````\n",
+        ]
+        step_events = [threading.Event() for _ in chunks]
+
+        class SteppedProvider:
+            name = "stepped-streaming"
+            def generate_stream(self, prompt, **kwargs):
+                for i, c in enumerate(chunks):
+                    step_events[i].wait()
+                    yield c
+
+        provider = SteppedProvider()
+        app = AegisTUI(self.config, provider, initial_prompt="Stepped intermediate test")
+
+        async with app.run_test() as pilot:
+            history = app.query_one("#chat-history", VerticalScroll)
+
+            # 1. Partial bold: '**bo' stays in pending tail, not yet in markdown source
+            step_events[0].set()
+            await pilot.pause(0.15)
+            md = history.query(Markdown).last()
+            tail = history.query(".assistant-tail").last()
+            self.assertNotIn("**bo", md.source)
+            self.assertIn("**bo", str(tail.content))
+
+            # 2. Closes bold: moves to markdown widget, tail is cleared
+            step_events[1].set()
+            await pilot.pause(0.15)
+            self.assertIn("**bold** text.", md.source)
+            self.assertEqual(str(tail.content), "")
+
+            # 3. Table header + separator: held in pending tail until row arrives
+            step_events[2].set()
+            await pilot.pause(0.15)
+            self.assertNotIn("| Col 1 | Col 2 |", md.source)
+            self.assertIn("| Col 1 | Col 2 |", str(tail.content))
+
+            # 4. Table row + delimiter end: table moves to markdown widget
+            step_events[3].set()
+            await pilot.pause(0.15)
+            self.assertIn("| Col 1 | Col 2 |", md.source)
+            self.assertEqual(str(tail.content), "")
+
+            # 5. Open code fence: stays in pending tail
+            step_events[4].set()
+            await pilot.pause(0.15)
+            self.assertNotIn("```python", md.source)
+            self.assertIn("```python", str(tail.content))
+
+            # 6. Closing fence: code block moves to markdown widget
+            step_events[5].set()
+            for _ in range(15):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+            self.assertIn("```python", md.source)
+            self.assertEqual(str(tail.content), "")
+
     async def test_pilot_worker_shutdown_on_quit_during_stalled_stream(self) -> None:
         """Worker thread shuts down cleanly when user quits during a delayed/stalled stream."""
         slow_chunks = ["Chunk 1\n", "Chunk 2\n", "Chunk 3\n", "Chunk 4\n"]
