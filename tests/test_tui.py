@@ -28,22 +28,29 @@ class FakeStreamingProvider:
 
     name = "fake-streaming"
 
-    def __init__(self, chunks: Sequence[str] | None = None, *, raise_stop: bool = False) -> None:
+    def __init__(self, chunks: Sequence[str] | None = None, *, raise_stop: bool = False, delay: float = 0.0) -> None:
         self.chunks = list(chunks) if chunks is not None else ["Chunk 1", " Chunk 2"]
         self.raise_stop = raise_stop
+        self.delay = delay
         self.calls: list[str] = []
+        self.kwargs_calls: list[dict] = []
 
-    def generate(self, prompt: str, **kwargs) -> str:
+    def generate(self, prompt: str, *, system: str | None = None, **kwargs) -> str:
         self.calls.append(prompt)
+        self.kwargs_calls.append({"prompt": prompt, "system": system, **kwargs})
         return "".join(self.chunks)
 
     def generate_stream(
-        self, prompt: str, *, stop_check=None, **kwargs
+        self, prompt: str, *, system: str | None = None, stop_check=None, **kwargs
     ) -> Iterator[str]:
+        import time
         self.calls.append(prompt)
+        self.kwargs_calls.append({"prompt": prompt, "system": system, **kwargs})
         for chunk in self.chunks:
             if stop_check is not None:
                 stop_check()
+            if self.delay > 0:
+                time.sleep(self.delay)
             if self.raise_stop:
                 raise StopRequested("Interrupted by test")
             yield chunk
@@ -205,3 +212,69 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(len(md_widgets) >= 1)
             last_md = md_widgets[-1]
             self.assertIn("Generation stopped", last_md.source)
+
+    async def test_pilot_system_prompt_propagation(self) -> None:
+        """System prompt is propagated cleanly to the model provider stream call."""
+        provider = FakeStreamingProvider(["System test response"])
+        app = AegisTUI(
+            self.config,
+            provider,
+            model="test-model:1b",
+            system="You are an ethical assistant with strict boundaries.",
+            initial_prompt="Ping with system",
+        )
+
+        async with app.run_test() as pilot:
+            await pilot.pause(0.25)
+            self.assertEqual(len(provider.kwargs_calls), 1)
+            self.assertEqual(
+                provider.kwargs_calls[0]["system"],
+                "You are an ethical assistant with strict boundaries.",
+            )
+
+    async def test_pilot_hostile_splits_and_partial_formatting(self) -> None:
+        """Unstable fragments (**bo, half table, open fence) are safely handled and render cleanly."""
+        hostile_chunks = [
+            "Intro paragraph.\n\n",
+            "This has **bo",
+            "ld** text.\n\n",
+            "| Name | Val |\n",
+            "|---|---|\n",
+            "| Item A | 10 |\n\n",
+            "````\n```python\n",
+            "x = 42\n```\n````\n\n",
+            "Final conclusion.\n",
+        ]
+        provider = FakeStreamingProvider(hostile_chunks)
+        app = AegisTUI(self.config, provider, initial_prompt="Hostile stream test")
+
+        async with app.run_test() as pilot:
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+            history = app.query_one("#chat-history", VerticalScroll)
+            md_widgets = list(history.query(Markdown))
+            self.assertTrue(len(md_widgets) >= 1)
+            final_source = md_widgets[-1].source
+
+            self.assertIn("Intro paragraph.", final_source)
+            self.assertIn("This has **bold** text.", final_source)
+            self.assertIn("| Name | Val |", final_source)
+            self.assertIn("```python", final_source)
+            self.assertIn("Final conclusion.", final_source)
+
+    async def test_pilot_worker_shutdown_on_quit_during_stalled_stream(self) -> None:
+        """Worker thread shuts down cleanly when user quits during a delayed/stalled stream."""
+        slow_chunks = ["Chunk 1\n", "Chunk 2\n", "Chunk 3\n", "Chunk 4\n"]
+        provider = FakeStreamingProvider(slow_chunks, delay=0.1)
+        app = AegisTUI(self.config, provider, initial_prompt="Stalled test")
+
+        async with app.run_test() as pilot:
+            await pilot.pause(0.05)
+            # Send quit signal (Ctrl+C)
+            await pilot.press("ctrl+c")
+            await pilot.pause(0.1)
+            # Verify stop event was set
+            self.assertTrue(app._stop_event.is_set())

@@ -56,6 +56,17 @@ class _StreamingHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             time.sleep(2.0)
 
+        elif self.scenario == "delayed_flush":
+            chunks = ["First", "Second", "Third"]
+            for c in chunks:
+                time.sleep(0.04)
+                line = json.dumps({"response": c, "done": False}) + "\n"
+                self.wfile.write(line.encode("utf-8"))
+                self.wfile.flush()
+            done_line = json.dumps({"response": "", "done": True}) + "\n"
+            self.wfile.write(done_line.encode("utf-8"))
+            self.wfile.flush()
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
@@ -117,6 +128,52 @@ class TestStreamingProvider(unittest.TestCase):
         self.assertEqual(len(chunks), 5)
         # All 5 chunks from loopback server should arrive within 0.15s (no fake sleep)
         self.assertLess(elapsed, 0.15, f"Chunks took {elapsed:.3f}s; artificial delay detected")
+
+    def test_delayed_flush_incremental_arrival_timestamps(self) -> None:
+        """Measure arrival timestamps of chunks to verify real incremental arrival over time."""
+        _StreamingHandler.scenario = "delayed_flush"
+        timestamps = []
+        chunks = []
+        for c in self.provider.generate_stream("test prompt"):
+            timestamps.append(time.monotonic())
+            chunks.append(c)
+
+        self.assertEqual(chunks, ["First", "Second", "Third"])
+        self.assertEqual(len(timestamps), 3)
+        delta1 = timestamps[1] - timestamps[0]
+        delta2 = timestamps[2] - timestamps[1]
+        self.assertGreaterEqual(delta1, 0.025, f"Delta 1 was {delta1:.4f}s")
+        self.assertGreaterEqual(delta2, 0.025, f"Delta 2 was {delta2:.4f}s")
+
+    def test_live_ollama_streaming_incremental_timestamps(self) -> None:
+        """If local Ollama is running, verify real LLM streaming arrives incrementally without fixed spacing."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.0) as resp:
+                data = json.loads(resp.read().decode())
+                models = [m.get("name") for m in data.get("models", [])]
+                if not models:
+                    self.skipTest("No models installed in local Ollama")
+                target_model = models[0]
+        except Exception:
+            self.skipTest("Local Ollama server not reachable")
+
+        live_provider = OllamaProvider(
+            host="http://127.0.0.1:11434",
+            default_model=target_model,
+            timeout=10.0,
+        )
+        timestamps = []
+        chunks = []
+        for c in live_provider.generate_stream("Reply with the numbers 1 to 5 separated by spaces."):
+            timestamps.append(time.monotonic())
+            chunks.append(c)
+            if len(chunks) >= 4:
+                break
+
+        self.assertGreaterEqual(len(chunks), 3)
+        for i in range(1, len(timestamps)):
+            self.assertGreater(timestamps[i], timestamps[i-1])
 
 
 class FakeStreamingProvider:

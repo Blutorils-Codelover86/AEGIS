@@ -5,6 +5,7 @@ import sys
 import threading
 from typing import Any, Callable, Sequence
 
+from aegis.cli.render import StreamBuffer
 from aegis.cli.theme import ACCENT, header_info
 from aegis.config import AegisConfig
 from aegis.errors import AegisError, StopRequested
@@ -93,6 +94,11 @@ Footer {
     margin-top: 1;
 }
 
+.assistant-tail {
+    color: #94a3b8;
+    margin-top: 0;
+}
+
 .error-box {
     margin: 1 0;
     padding: 1;
@@ -139,7 +145,9 @@ class AegisTUI(App):
         provider: ModelProvider,
         *,
         model: str | None = None,
+        system: str | None = None,
         initial_prompt: str | None = None,
+        no_memory: bool = False,
     ) -> None:
         if not TEXTUAL_AVAILABLE:
             raise ImportError(
@@ -149,7 +157,9 @@ class AegisTUI(App):
         self.config = config
         self.provider = provider
         self.model = model or config.model
+        self.system = system
         self.initial_prompt = initial_prompt
+        self.no_memory = no_memory
         self.stop_ctrl = StopController(config.stop_file)
         self._stop_event = threading.Event()
         self._generating = False
@@ -171,10 +181,12 @@ class AegisTUI(App):
         history = self.query_one("#chat-history", VerticalScroll)
 
         if not self.initial_prompt:
+            mem_status = "disabled (--no-memory)" if self.no_memory else "safe local SQLite (explicit commands)"
             welcome_text = (
                 f"**AEGIS Terminal Assistant**\n\n"
                 f"• Model: `{self.model}`\n"
-                f"• Local Ollama: `{self.config.ollama_host}`\n"
+                f"• Provider: `{self.config.ollama_host}`\n"
+                f"• Memory: `{mem_status}`\n"
                 f"• Type a prompt below to begin chatting.\n"
                 f"• Press **Ctrl+C** or **Ctrl+Q** to exit, **Ctrl+L** to clear."
             )
@@ -206,55 +218,79 @@ class AegisTUI(App):
         )
         await history.mount(user_container)
 
-        # Mount Assistant Message placeholder
-        asst_md = Markdown("Thinking...", classes="assistant-markdown")
+        # Mount Assistant Message container with stable Markdown widget + pending tail
+        asst_md = Markdown("", classes="assistant-markdown")
+        asst_tail = Static("Thinking...", classes="assistant-tail")
         asst_container = Vertical(
             Static(f"AEGIS ({self.model})", classes="assistant-label"),
             asst_md,
+            asst_tail,
             classes="assistant-box",
         )
         await history.mount(asst_container)
         history.scroll_end(animate=False)
 
         # Run model stream worker in background thread
-        self.run_worker(lambda: self._generate_stream_task(asst_md, prompt), thread=True)
+        self.run_worker(lambda: self._generate_stream_task(asst_md, asst_tail, prompt), thread=True)
 
-    def _generate_stream_task(self, md_widget: Markdown, prompt: str) -> None:
-        accum = ""
+    def _generate_stream_task(self, md_widget: Markdown, tail_widget: Static, prompt: str) -> None:
+        buf = StreamBuffer()
+        accum_stable = ""
+        first = True
         try:
             self._check_stop()
             if hasattr(self.provider, "generate_stream"):
                 stream = self.provider.generate_stream(
                     prompt,
+                    system=self.system,
                     model=self.model,
                     stop_check=self._check_stop,
                 )
-                first = True
                 for chunk in stream:
                     if self._stop_event.is_set():
                         break
                     if first:
-                        accum = chunk
                         first = False
-                    else:
-                        accum += chunk
-                    self.call_from_thread(md_widget.update, accum)
+                        self.call_from_thread(tail_widget.update, "")
+
+                    ready = buf.feed(chunk)
+                    if ready:
+                        accum_stable += ready
+                        self.call_from_thread(md_widget.update, accum_stable)
+                    # Display pending tail as literal text
+                    pending = buf._buffer
+                    self.call_from_thread(tail_widget.update, pending)
                     self.call_from_thread(self._scroll_history)
             else:
                 response = self.provider.generate(
                     prompt,
+                    system=self.system,
                     model=self.model,
                     stop_check=self._check_stop,
                 )
-                accum = response
-                self.call_from_thread(md_widget.update, accum)
+                accum_stable = response
+                self.call_from_thread(md_widget.update, accum_stable)
+                self.call_from_thread(tail_widget.update, "")
                 self.call_from_thread(self._scroll_history)
+
+            # End of stream: flush any remaining buffer to stable markdown
+            remaining = buf.flush()
+            if remaining:
+                accum_stable += remaining
+                self.call_from_thread(md_widget.update, accum_stable)
+            self.call_from_thread(tail_widget.update, "")
+            self.call_from_thread(self._scroll_history)
         except StopRequested as e:
-            if not accum:
-                accum = f"*[Generation stopped: {e}]*"
+            remaining = buf.flush()
+            if remaining:
+                accum_stable += remaining
+            stop_msg = f"*[Generation stopped: {e}]*"
+            if not accum_stable:
+                accum_stable = stop_msg
             else:
-                accum += f"\n\n*[Generation stopped: {e}]*"
-            self.call_from_thread(md_widget.update, accum)
+                accum_stable += f"\n\n{stop_msg}"
+            self.call_from_thread(md_widget.update, accum_stable)
+            self.call_from_thread(tail_widget.update, "")
         except Exception as exc:
             self.call_from_thread(self._post_error, str(exc))
         finally:
@@ -293,7 +329,9 @@ def run_tui(
     provider: ModelProvider,
     *,
     model: str | None = None,
+    system: str | None = None,
     initial_prompt: str | None = None,
+    no_memory: bool = False,
 ) -> int:
     """Launch the interactive Textual TUI.
 
@@ -304,6 +342,13 @@ def run_tui(
         raise ImportError(
             "Textual is not installed. Please install it with: pip install 'aegis-ai[tui]'"
         )
-    app = AegisTUI(config=config, provider=provider, model=model, initial_prompt=initial_prompt)
+    app = AegisTUI(
+        config=config,
+        provider=provider,
+        model=model,
+        system=system,
+        initial_prompt=initial_prompt,
+        no_memory=no_memory,
+    )
     app.run()
     return 0

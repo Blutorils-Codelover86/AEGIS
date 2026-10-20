@@ -7,29 +7,30 @@ from typing import Any
 from rich.console import Console
 from rich.markdown import Markdown
 
-MIN_SAFE_WIDTH = 60
+MIN_SAFE_WIDTH = 10
 
 
 def safe_width(console: Console | None = None, min_width: int = MIN_SAFE_WIDTH) -> int:
-    """Clamp console width to a safe minimum so tables and code blocks do not break."""
+    """Return console width respecting narrow terminals down to min_width."""
     if console is None:
-        return max(80, min_width)
+        return 80
     w = getattr(console, "width", 80) or 80
     return max(w, min_width)
 
 
-def _is_table_line(line: str) -> bool:
-    """Check whether a line is part of a markdown table."""
+def _has_unescaped_pipe(line: str) -> bool:
+    """Check whether a line contains an unescaped pipe character outside inline code."""
+    # Strip closed inline code spans first so code like `a | b` does not trigger table logic
+    cleaned = re.sub(r"`[^`]*`", "", line)
+    return bool(re.search(r"(?<!\\)(?:\\\\)*\|", cleaned))
+
+
+def _is_table_separator(line: str) -> bool:
+    """Check whether a line is a markdown table delimiter row (e.g. |---|---| or --- | ---)."""
     s = line.strip()
-    if not s:
+    if not s or not _has_unescaped_pipe(s):
         return False
-    if s.startswith("|"):
-        return True
-    if "|" in s and re.match(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?$", s):
-        return True
-    if s.count("|") >= 2:
-        return True
-    return False
+    return bool(re.match(r"^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?$", s))
 
 
 def _has_unclosed_bold(text: str) -> bool:
@@ -75,32 +76,48 @@ class StreamBuffer:
 
         safe_index = 0
         in_fence = False
-        fence_marker = ""
+        fence_char = ""
+        fence_len = 0
         in_table = False
 
         for i, line in enumerate(lines):
-            stripped = line.strip()
-            # Fenced code block handling
+            # 1. Code fence handling
             if not in_fence:
-                if stripped.startswith("```"):
+                fence_match = re.match(r"^[ ]{0,3}(`{3,}|~{3,})", line)
+                if fence_match:
                     in_fence = True
-                    fence_marker = "```"
-                elif stripped.startswith("~~~"):
-                    in_fence = True
-                    fence_marker = "~~~"
+                    fence_char = fence_match.group(1)[0]
+                    fence_len = len(fence_match.group(1))
+                    if in_table:
+                        in_table = False
             else:
-                if stripped.startswith(fence_marker):
+                # Inside fence: close only on line with >= opening run of same char and only trailing whitespace
+                close_match = re.match(rf"^[ ]{{0,3}}\{fence_char}{{{fence_len},}}\s*$", line)
+                if close_match:
                     in_fence = False
-                    fence_marker = ""
+                    fence_char = ""
+                    fence_len = 0
 
-            # Markdown table handling (only outside code fences)
+            # 2. Table handling (only outside code fences)
             if not in_fence:
-                if _is_table_line(line):
-                    in_table = True
+                if in_table:
+                    # Inside active table: continues as long as line is non-blank and has unescaped pipe
+                    if not line.strip() or not _has_unescaped_pipe(line):
+                        in_table = False
                 else:
-                    in_table = False
+                    # Potential table header or line with pipe
+                    if _has_unescaped_pipe(line):
+                        if i + 1 < len(lines):
+                            next_line = lines[i + 1]
+                            if _is_table_separator(next_line):
+                                in_table = True
+                            else:
+                                in_table = False
+                        else:
+                            # Next line is not yet in the buffer; hold back this line
+                            break
 
-            # Check safe point (outside fences and tables, with closed bold)
+            # 3. Check safe point (outside fences and tables, with closed bold)
             if not in_fence and not in_table:
                 sub_text = "".join(lines[: i + 1])
                 if not _has_unclosed_bold(sub_text):

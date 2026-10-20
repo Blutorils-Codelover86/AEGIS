@@ -137,6 +137,60 @@ class TestStreamBuffer(unittest.TestCase):
         res2 = [buf2.feed(c) for c in chunks] + [buf2.flush()]
         self.assertEqual(res1, res2)
 
+    def test_pipe_free_table_header_held(self) -> None:
+        """Pipe-free header (no leading/trailing pipe) must be held until separator verifies table."""
+        self.assertEqual(self.buf.feed("Name | Value\n"), "")
+        self.assertEqual(self.buf.feed("---|---\n"), "")
+        self.assertEqual(self.buf.feed("Alice | 100\n"), "")
+        emitted = self.buf.feed("\nDone.\n")
+        self.assertIn("Name | Value", emitted)
+        self.assertIn("---|---", emitted)
+        self.assertIn("Alice | 100", emitted)
+        self.assertIn("Done.\n", emitted)
+
+    def test_pipe_in_prose_released_when_not_table(self) -> None:
+        """Pipes in shell pipelines or prose must be released when next line is not a separator."""
+        self.assertEqual(self.buf.feed("Use cat file | grep foo\n"), "")
+        emitted = self.buf.feed("Next prose line.\n\n")
+        self.assertEqual(emitted, "Use cat file | grep foo\nNext prose line.\n\n")
+
+    def test_embedded_fence_like_code_and_invalid_closers(self) -> None:
+        """Outer 4-backtick fence must not be closed by inner 3-backtick fence or info strings."""
+        self.assertEqual(self.buf.feed("````\n```python\nprint('hello')\n```\n"), "")
+        # ```python is invalid closer; ``` is only 3 ticks (needs 4)
+        self.assertEqual(self.buf.feed("````extra\n"), "")  # non-whitespace after closer
+        # Valid closer: 4 ticks with only whitespace
+        emitted = self.buf.feed("````\n\nNext text\n")
+        self.assertIn("```python", emitted)
+        self.assertIn("````\n", emitted)
+        self.assertIn("Next text\n", emitted)
+
+    def test_crlf_segmentation(self) -> None:
+        """StreamBuffer handles CRLF line endings without corrupting segmentation."""
+        self.assertEqual(self.buf.feed("Line 1\r\nLine 2\r\n"), "Line 1\r\nLine 2\r\n")
+        self.assertEqual(self.buf.feed("Header | Val\r\n---|---\r\nA | 1\r\n\r\n"), "Header | Val\r\n---|---\r\nA | 1\r\n\r\n")
+
+    def test_single_character_chunk_stream(self) -> None:
+        """Feeding single-character chunks produces identical output to feeding all at once."""
+        full_text = "Intro.\n\n| H1 | H2 |\n|---|---|\n| R1 | R2 |\n\n```python\nx = 1\n```\nOutro.\n"
+        emitted = []
+        for ch in full_text:
+            out = self.buf.feed(ch)
+            if out:
+                emitted.append(out)
+        emitted.append(self.buf.flush())
+        self.assertEqual("".join(emitted), full_text)
+
+    def test_large_unclosed_block_buffering(self) -> None:
+        """Large unclosed block (e.g. 500 lines) is safely buffered without premature emission."""
+        self.assertEqual(self.buf.feed("```python\n"), "")
+        for i in range(500):
+            self.assertEqual(self.buf.feed(f"line_{i} = {i}\n"), "")
+        # Flushed cleanly at stream completion
+        flushed = self.buf.flush()
+        self.assertIn("line_0 = 0\n", flushed)
+        self.assertIn("line_499 = 499\n", flushed)
+
 
 if __name__ == "__main__":
     unittest.main()

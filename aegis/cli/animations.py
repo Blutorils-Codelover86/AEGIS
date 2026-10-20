@@ -123,7 +123,7 @@ class StreamIndicator:
             self.start()
         if self._status is not None:
             rate = (chunks / elapsed) if elapsed > 0.05 else 0.0
-            msg = f"[aegis.muted]▍ streaming · {rate:.1f} tok/s[/aegis.muted]"
+            msg = f"[aegis.muted]▍ streaming · {rate:.1f} chunks/s[/aegis.muted]"
             try:
                 self._status.update(msg)
             except Exception:
@@ -152,5 +152,5 @@ def completion(
         return
     rate = (chunks / elapsed) if elapsed > 0.001 else 0.0
     console.print(
-        f"[aegis.muted]▍ done · {chunks} chunks in {elapsed:.2f}s ({rate:.1f} tok/s)[/aegis.muted]"
+        f"[aegis.muted]▍ done · {chunks} chunks in {elapsed:.2f}s ({rate:.1f} chunks/s)[/aegis.muted]"
     )

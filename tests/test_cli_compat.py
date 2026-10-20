@@ -157,6 +157,73 @@ class TestCLICompat(unittest.TestCase):
         self.assertIn("--plain", out_chat.getvalue())
         self.assertIn("--model", out_chat.getvalue())
 
+    def test_global_flags_before_command(self) -> None:
+        """Global --plain and --no-color placed before subcommand must not be overwritten by subparser."""
+        fake = FakeProvider(response="# Heading\n- Item 1\n**bold text**")
+
+        # 1. aegis --plain chat
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = main(["--plain", "chat", "--prompt", "test prompt"], provider=fake, config=self.config)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("\033", out.getvalue())
+        self.assertNotIn("\x1b", out.getvalue())
+        self.assertIn("# Heading", out.getvalue())
+
+        # 2. aegis --no-color chat
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = main(["--no-color", "chat", "--prompt", "test prompt"], provider=fake, config=self.config)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("\033", out.getvalue())
+        self.assertNotIn("\x1b", out.getvalue())
+
+        # 3. Nested memory commands: root, parent, and subparser placements
+        for argv in [
+            ["--plain", "memory", "list"],
+            ["memory", "--plain", "list"],
+            ["memory", "list", "--plain"],
+        ]:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = main(argv, config=self.config)
+            self.assertEqual(rc, 0, f"Failed for {argv}")
+            self.assertNotIn("\033", out.getvalue())
+
+    def test_narrow_terminal_width_columns_20(self) -> None:
+        """Running with narrow terminal COLUMNS=20 does not crash or raise layout exceptions."""
+        fake = FakeProvider(response="Header | Value\n---|---\nRow 1 | 12345\n\n```python\nprint(1)\n```")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"COLUMNS": "20"}):
+            with redirect_stdout(out):
+                rc = main(["chat", "--prompt", "test narrow"], provider=fake, config=self.config)
+        self.assertEqual(rc, 0)
+        self.assertTrue(len(out.getvalue()) > 0)
+
+    def test_interrupted_stream_flushes_partial_buffer(self) -> None:
+        """On KeyboardInterrupt during streaming, un-emitted buffer is flushed as literal text and rc is 130."""
+        class InterruptingProvider:
+            name = "interrupting"
+            def generate_stream(self, prompt, **kwargs):
+                yield "First paragraph.\n\n"
+                yield "Partial **unclosed bold text"
+                raise KeyboardInterrupt()
+            def health(self):
+                return True
+            def list_models(self):
+                return ["test:latest"]
+
+        provider = InterruptingProvider()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = main(["chat", "--prompt", "stream partial"], provider=provider, config=self.config)
+
+        self.assertEqual(rc, 130)
+        val = out.getvalue()
+        # Ensure partial text was kept on screen
+        self.assertIn("Partial **unclosed bold text", val)
+        self.assertIn("Stop requested by user", val)
+
 
 if __name__ == "__main__":
     unittest.main()

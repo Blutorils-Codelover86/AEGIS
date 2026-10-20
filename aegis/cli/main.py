@@ -187,19 +187,19 @@ def _build_parser() -> _AegisArgumentParser:
     chat_parser.add_argument("--system", "-s", type=str, default=None, help="System prompt")
     chat_parser.add_argument("--no-memory", action="store_true", help="Disable memory")
     chat_parser.add_argument("--max-turns", type=int, default=None, help="Max turns in chat session")
-    chat_parser.add_argument("--plain", action="store_true", help="Plain text output without color or formatting")
-    chat_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    chat_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output without color or formatting")
+    chat_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
     chat_parser.add_argument("--tui", action="store_true", help="Launch interactive Textual TUI")
 
     # status
     status_parser = subparsers.add_parser("status", help="Show system status")
-    status_parser.add_argument("--plain", action="store_true", help="Plain text output")
-    status_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    status_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    status_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
 
     # memory
     mem_parser = subparsers.add_parser("memory", help="Memory management commands")
-    mem_parser.add_argument("--plain", action="store_true", help="Plain text output")
-    mem_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    mem_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    mem_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
     mem_sub = mem_parser.add_subparsers(dest="memory_action", required=True)
 
     # memory save
@@ -207,33 +207,33 @@ def _build_parser() -> _AegisArgumentParser:
     mem_save.add_argument("text", type=str, help="Memory text content")
     mem_save.add_argument("--tag", "-t", action="extend", nargs="+", default=[], help="Tag(s)")
     mem_save.add_argument("--source", "-s", type=str, default=None, help="Source metadata")
-    mem_save.add_argument("--plain", action="store_true", help="Plain text output")
-    mem_save.add_argument("--no-color", action="store_true", help="Disable colored output")
+    mem_save.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    mem_save.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
 
     # memory search
     mem_search = mem_sub.add_parser("search", help="Search memory records")
     mem_search.add_argument("query", type=str, help="Search query")
     mem_search.add_argument("--limit", "-n", type=int, default=None, help="Maximum results")
-    mem_search.add_argument("--plain", action="store_true", help="Plain text output")
-    mem_search.add_argument("--no-color", action="store_true", help="Disable colored output")
+    mem_search.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    mem_search.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
 
     # memory list
     mem_list = mem_sub.add_parser("list", help="List recent memory records")
     mem_list.add_argument("--limit", "-n", type=int, default=None, help="Maximum results")
-    mem_list.add_argument("--plain", action="store_true", help="Plain text output")
-    mem_list.add_argument("--no-color", action="store_true", help="Disable colored output")
+    mem_list.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    mem_list.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
 
     # memory delete
     mem_delete = mem_sub.add_parser("delete", help="Delete a memory record")
     mem_delete.add_argument("record_id", type=str, help="Record ID to delete")
-    mem_delete.add_argument("--plain", action="store_true", help="Plain text output")
-    mem_delete.add_argument("--no-color", action="store_true", help="Disable colored output")
+    mem_delete.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    mem_delete.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
 
     # stop
     stop_parser = subparsers.add_parser("stop", help="Request or clear stop signal")
     stop_parser.add_argument("--clear", action="store_true", help="Clear stop signal")
-    stop_parser.add_argument("--plain", action="store_true", help="Plain text output")
-    stop_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    stop_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
+    stop_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
 
     return parser
 
@@ -398,11 +398,19 @@ def _stream_response(
     except KeyboardInterrupt:
         thinking.stop()
         stream_ind.stop()
+        if not is_plain:
+            remaining = buf.flush()
+            if remaining:
+                render_plain(console, remaining)
         print("\n[Stop requested by user]")
         return 130
     except StopRequested as e:
         thinking.stop()
         stream_ind.stop()
+        if not is_plain:
+            remaining = buf.flush()
+            if remaining:
+                render_plain(console, remaining)
         print(f"\n[Operation stopped: {e}]", file=sys.stderr)
         return 130
 
@@ -424,7 +432,14 @@ def _handle_chat(
         else:
             try:
                 from aegis.cli.tui import run_tui
-                return run_tui(config, provider, model=args.model, initial_prompt=args.prompt)
+                return run_tui(
+                    config,
+                    provider,
+                    model=args.model,
+                    system=args.system,
+                    initial_prompt=args.prompt,
+                    no_memory=getattr(args, "no_memory", False),
+                )
             except ImportError as err:
                 sys.stderr.write(f"Textual TUI is not installed ({err}). Falling back to terminal chat. Install with: pip install 'aegis-ai[tui]'\n")
 

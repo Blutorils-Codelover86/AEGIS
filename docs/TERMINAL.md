@@ -48,16 +48,18 @@ Emits raw, unformatted text without any ANSI escape sequences, theme styling, or
 - Ideal for UNIX pipes (`aegis chat --plain | jq ...`), shell scripts, or clean file redirection.
 - Never outputs ANSI color codes (verified zero `\033` bytes).
 - Suppresses decorative banners, spinners, and completion lines.
+- May be placed globally before any command (e.g. `aegis --plain chat`, `aegis --plain memory list`) or after subcommands (`aegis chat --plain`).
 
 ### `--no-color` (and `NO_COLOR` environment variable)
 Disables terminal color codes while preserving rich layout (such as ASCII table borders and list spacing).
 - Adheres strictly to the [no-color.org](https://no-color.org) specification.
-- Activated by either `--no-color` on the command line or setting `NO_COLOR=1` in the environment.
+- Activated by either `--no-color` on the command line (globally or per command) or setting `NO_COLOR=1` in the environment.
 
 ### `--tui`
 Launches the full-screen interactive Textual terminal UI (Phase B).
 - Requires the optional `tui` extra: `pip install "aegis-ai[tui]"`.
 - Requires an interactive TTY stdout.
+- Supports `--model`, `--system`, `--prompt`, and `--no-memory`.
 - If Textual is not installed or stdout is redirected/non-TTY, AEGIS prints a clear warning to stderr and seamlessly falls back to standard Rich terminal chat without failing.
 
 ### `--model <name>`
@@ -109,6 +111,7 @@ aegis chat --tui --prompt "What are the core safety tenets of AEGIS?"
 - **Model Identity Header**: Persistent top header displaying session identity (`AEGIS · <model> · local`).
 - **Scrollable Message History**: Distinct visual styling for user queries (light blue accent `#60A5FA`) versus assistant responses (`#3B82F6` accent).
 - **Non-blocking Worker Streaming**: Generation tasks run in isolated background worker threads using `provider.generate_stream()`, continuously posting markdown chunk updates to the UI thread via thread-safe callbacks without dropping UI frames.
+- **Safe Fragment Buffering**: Incoming deltas are filtered through `StreamBuffer`. Only stable, complete Markdown blocks update the `Markdown` widget; incomplete tails (`**bo`, open fences, unclosed tables) display in a pending literal-text tail until closed, preventing UI distortion.
 - **Full Markdown Rendering**: Native Textual `Markdown` widget renders formatted text, headers, lists, code fences, and tables.
 - **Graceful Fallback**: The core CLI lazily imports Textual only when `--tui` is requested. If the dependency is missing or stdout is non-interactive, AEGIS logs a clear fallback notice and routes through the standard Rich streaming engine.
 
@@ -120,14 +123,15 @@ aegis chat --tui --prompt "What are the core safety tenets of AEGIS?"
 
 Rendering streaming Markdown incrementally in a terminal presents subtle segmentation hazards:
 1. **Trailing partial lines**: Splitting an incoming word or escape sequence mid-character.
-2. **Open code fences**: Emitting an opening ` ``` ` before its corresponding closing fence arrives causes terminal formatters to mangle syntax highlighting.
-3. **Incomplete tables**: Markdown tables require header, delimiter, and row alignments; emitting rows piecemeal degrades rendering into raw text.
+2. **Open code fences**: Emitting an opening ` ``` ` before its corresponding closing fence arrives causes terminal formatters to mangle syntax highlighting. Supports embedded code fences (e.g. 4-backtick fences containing 3-backtick fences) and requires strict length matching for fence closures.
+3. **Incomplete tables & Pipe-free headers**: Table headers such as `Name | Value` (without leading/trailing pipes) are held until the delimiter row confirms table structure. Delimiter rows and data rows are held until the table concludes, preventing half-open table emission.
 4. **Partial bold**: Spanning `**bold text**` across chunk boundaries must not leak unclosed formatting.
+5. **Narrow Terminals**: `safe_width` respects narrow terminals down to `COLUMNS=20` without wrapping overflow.
 
 AEGIS solves this with `aegis.cli.render.StreamBuffer`:
 - Buffers incoming stream chunks deterministically.
 - `feed(chunk: str) -> str`: Emits only stable prefixes safe to render as complete Markdown blocks.
-- `flush() -> str`: Emits any remaining buffered content at the conclusion of the generation stream.
+- `flush() -> str`: Emits any remaining buffered content at the conclusion of the generation stream (or on interruption).
 - **Invariant**: Never emits a half-open fence or a partial table row.
 
 ### No Fake Typewriter Delays
@@ -139,13 +143,14 @@ AEGIS renders Ollama tokens **as they are received**:
 ### Indicators & Clean Signal Handling
 
 1. **ThinkingIndicator**: Displays a non-intrusive dot spinner while waiting for Ollama to return response headers and the first token. Stops the instant the first chunk arrives.
-2. **StreamIndicator**: Subtly tracks token emission rate (e.g. `▍ streaming · 12.4 tok/s`) during active streaming.
+2. **StreamIndicator**: Subtly tracks chunk emission rate (e.g. `▍ streaming · 12.4 chunks/s`) during active streaming.
 3. **Completion**: Prints a single summary line when generation completes:
    ```text
-   ▍ done · 63 chunks in 6.87s (9.2 tok/s)
+   ▍ done · 63 chunks in 6.87s (9.2 chunks/s)
    ```
 4. **Clean Ctrl+C**: When the operator sends `SIGINT` (Ctrl+C) mid-stream:
    - Indicators stop cleanly.
+   - Any un-emitted text in `StreamBuffer` is flushed immediately as literal text.
    - Text rendered up to that point is preserved on the terminal screen.
    - Prints `[Stop requested by user]`.
    - Exits immediately with standard status code `130`.
