@@ -21,10 +21,12 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-To install development dependencies (e.g. pytest):
+To install development or optional full-screen TUI dependencies:
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]"       # Development and test tools
+pip install -e ".[tui]"       # Optional full-screen Textual TUI
+pip install -e ".[tui,dev]"   # Complete installation
 ```
 
 ---
@@ -36,6 +38,17 @@ Stream a rich, styled markdown chat response from your local model:
 ```bash
 aegis chat --prompt "Show a markdown table of 2 rows"
 ```
+
+Launch the full-screen interactive Textual TUI (requires `[tui]` extra):
+
+```bash
+aegis chat --tui
+```
+
+Keybindings in TUI:
+- `Ctrl+C` / `Ctrl+Q`: Quit
+- `Ctrl+L`: Clear history
+- `Enter`: Submit message
 
 Run plain, unstyled output suitable for shell pipes and scripts:
 

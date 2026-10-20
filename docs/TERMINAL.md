@@ -56,14 +56,65 @@ Disables terminal color codes while preserving rich layout (such as ASCII table 
 
 ### `--tui`
 Launches the full-screen interactive Textual terminal UI (Phase B).
-- If the optional dependency is not installed (`pip install 'aegis-ai[tui]'`), AEGIS prints a clear instruction and exits cleanly with code 2.
+- Requires the optional `tui` extra: `pip install "aegis-ai[tui]"`.
+- Requires an interactive TTY stdout.
+- If Textual is not installed or stdout is redirected/non-TTY, AEGIS prints a clear warning to stderr and seamlessly falls back to standard Rich terminal chat without failing.
 
 ### `--model <name>`
 Overrides the model for the command or chat session (e.g. `--model gemma3:4b` or `--model qwen2.5-coder:1.5b`). Accepts any local Ollama model without validation restrictions.
 
 ---
 
-## 3. Streaming & Animations Architecture
+## 3. Full-Screen Interactive TUI (Textual)
+
+Project AEGIS provides an optional, full-screen terminal interface built with [Textual](https://github.com/Textualize/textual).
+
+### Installation
+
+Install the `tui` optional dependency into your virtual environment:
+
+```bash
+pip install -e ".[tui]"
+# or for an existing release:
+pip install "aegis-ai[tui]"
+```
+
+### Launching
+
+Launch the full-screen TUI:
+
+```bash
+# Start an interactive chat session
+aegis chat --tui
+
+# Start with a specific model
+aegis chat --tui --model gemma3:1b
+
+# Start with an initial prompt
+aegis chat --tui --prompt "What are the core safety tenets of AEGIS?"
+```
+
+### Keybindings & Controls
+
+| Keybinding | Action | Description |
+|---|---|---|
+| `Ctrl+C` | Quit | Gracefully stops generation workers and exits the application |
+| `Ctrl+Q` | Quit | Immediate clean exit |
+| `Ctrl+L` | Clear | Clears chat message history |
+| `Enter` | Submit | Submits current prompt in the input box |
+
+### Architecture & Design
+
+- **Dark-Friendly Aesthetics**: Designed with high-contrast slate-950 (`#0F172A`) background and `#3B82F6` electric blue branding.
+- **Model Identity Header**: Persistent top header displaying session identity (`AEGIS · <model> · local`).
+- **Scrollable Message History**: Distinct visual styling for user queries (light blue accent `#60A5FA`) versus assistant responses (`#3B82F6` accent).
+- **Non-blocking Worker Streaming**: Generation tasks run in isolated background worker threads using `provider.generate_stream()`, continuously posting markdown chunk updates to the UI thread via thread-safe callbacks without dropping UI frames.
+- **Full Markdown Rendering**: Native Textual `Markdown` widget renders formatted text, headers, lists, code fences, and tables.
+- **Graceful Fallback**: The core CLI lazily imports Textual only when `--tui` is requested. If the dependency is missing or stdout is non-interactive, AEGIS logs a clear fallback notice and routes through the standard Rich streaming engine.
+
+---
+
+## 4. Streaming & Animations Architecture
 
 ### Safe Incremental Rendering (`StreamBuffer`)
 

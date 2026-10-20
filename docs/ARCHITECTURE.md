@@ -20,7 +20,8 @@ aegis/
 │   ├── main.py          # CLI command parser, dispatch, and stream execution
 │   ├── theme.py         # AEGIS blue visual identity, theme tokens, headers, prefixes
 │   ├── render.py        # Safe incremental StreamBuffer, Markdown and plain renderers
-│   └── animations.py    # Capability-gated spinners, streaming indicators, completion
+│   ├── animations.py    # Capability-gated spinners, streaming indicators, completion
+│   └── tui.py           # Optional full-screen Textual TUI (lazy-imported)
 ├── memory/              # Explicit SQLite-backed memory store
 │   └── __init__.py
 ├── provider/            # Local model provider (Ollama HTTP client over 127.0.0.1)

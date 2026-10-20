@@ -419,12 +419,14 @@ def _handle_chat(
         console = make_console(plain=is_plain)
 
     if getattr(args, "tui", False):
-        try:
-            from aegis.cli.tui import run_tui
-            return run_tui(config, provider, model=args.model)
-        except ImportError:
-            sys.stderr.write("Error: Textual TUI is not installed. Install with: pip install 'aegis-ai[tui]'\n")
-            return 2
+        if not sys.stdout.isatty():
+            sys.stderr.write("Textual TUI requires a TTY. Falling back to terminal chat.\n")
+        else:
+            try:
+                from aegis.cli.tui import run_tui
+                return run_tui(config, provider, model=args.model, initial_prompt=args.prompt)
+            except ImportError as err:
+                sys.stderr.write(f"Textual TUI is not installed ({err}). Falling back to terminal chat. Install with: pip install 'aegis-ai[tui]'\n")
 
     caps = capabilities(console, plain=is_plain)
     stop_ctrl = StopController(config.stop_file)
@@ -585,7 +587,7 @@ def _handle_memory(
             if console.no_color:
                 console.print(f"Saved memory [{rec.id}]")
             else:
-                console.print(f"[aegis.success]Saved memory[/aegis.success] [{rec.id}]")
+                console.print(f"[aegis.success]Saved memory[/aegis.success] \\[{rec.id}]")
             return 0
         elif args.memory_action == "search":
             limit = args.limit if args.limit is not None else config.max_memory_results
@@ -597,7 +599,7 @@ def _handle_memory(
                 for r in records:
                     tag_str = f" tags={list(r.tags)}" if r.tags else ""
                     src_str = f" source={r.source}" if r.source else ""
-                    console.print(f"[{r.id}] {r.content}{tag_str}{src_str}")
+                    console.print(f"[{r.id}] {r.content}{tag_str}{src_str}", markup=False)
             return 0
         elif args.memory_action == "list":
             limit = args.limit if args.limit is not None else config.max_memory_results
@@ -609,7 +611,7 @@ def _handle_memory(
                 for r in records:
                     tag_str = f" tags={list(r.tags)}" if r.tags else ""
                     src_str = f" source={r.source}" if r.source else ""
-                    console.print(f"[{r.id}] {r.content}{tag_str}{src_str}")
+                    console.print(f"[{r.id}] {r.content}{tag_str}{src_str}", markup=False)
             return 0
         elif args.memory_action == "delete":
             deleted = store.delete(args.record_id)
@@ -617,9 +619,9 @@ def _handle_memory(
                 if console.no_color:
                     console.print(f"Deleted memory [{args.record_id}]")
                 else:
-                    console.print(f"[aegis.success]Deleted memory[/aegis.success] [{args.record_id}]")
+                    console.print(f"[aegis.success]Deleted memory[/aegis.success] \\[{args.record_id}]")
             else:
-                console.print(f"Memory record not found: {args.record_id}")
+                console.print(f"Memory record not found: {args.record_id}", markup=False)
             return 0
         else:
             sys.stderr.write(f"Unknown memory action: {args.memory_action}\n")
