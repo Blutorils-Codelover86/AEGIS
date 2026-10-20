@@ -31,9 +31,27 @@ pip install -e ".[dev]"
 
 ## Quickstart & Demo
 
-Run the automated end-to-end Sprint 001 demonstration:
+Stream a rich, styled markdown chat response from your local model:
 
 ```bash
+aegis chat --prompt "Show a markdown table of 2 rows"
+```
+
+Run plain, unstyled output suitable for shell pipes and scripts:
+
+```bash
+aegis chat --plain --prompt "List 3 colors"
+```
+
+For full terminal features, styling tokens, accessibility flags, and streaming indicator details, see [docs/TERMINAL.md](docs/TERMINAL.md).
+
+Run the automated end-to-end demonstrations:
+
+```bash
+# Terminal core demonstration (Sprint 002)
+bash scripts/demo_terminal.sh
+
+# Sprint 001 architecture & safety demonstration
 bash scripts/demo_sprint001.sh
 ```
 
@@ -52,26 +70,26 @@ See [docs/DEMO.md](docs/DEMO.md) for full output transcripts, reproduction logs,
 AEGIS exposes an intuitive command-line interface:
 
 ```bash
-# Chat with the local model (single-shot or interactive REPL)
-aegis chat [--prompt "Your question"] [--model MODEL] [--system "System prompt"] [--no-memory] [--max-turns 20]
+# Chat with the local model (single-shot or interactive REPL with real streaming)
+aegis chat [--prompt "Your question"] [--model MODEL] [--system "System prompt"] [--plain] [--no-color] [--tui] [--no-memory] [--max-turns 20]
 
 # Check health of local services, provider status, and memory stats
-aegis status
+aegis status [--plain] [--no-color]
 
 # Save explicit knowledge to the SQLite memory store
-aegis memory save "Important note or memory" [--tag TAG ...] [--source SOURCE]
+aegis memory save "Important note or memory" [--tag TAG ...] [--source SOURCE] [--plain]
 
 # Search saved memories
-aegis memory search "query" [--limit 5]
+aegis memory search "query" [--limit 5] [--plain]
 
 # List stored memories
-aegis memory list [--limit 50]
+aegis memory list [--limit 50] [--plain]
 
 # Delete a specific memory record
-aegis memory delete RECORD_ID
+aegis memory delete RECORD_ID [--plain]
 
 # Signal an emergency stop or clear an existing stop flag
-aegis stop [--clear]
+aegis stop [--clear] [--plain]
 ```
 
 ---

@@ -15,8 +15,12 @@ aegis/
 ├── config.py            # AegisConfig dataclass, TOML parsing, env overrides, directory bootstrap
 ├── audit.py             # JsonlAuditLogger, read_events, InMemoryAuditLogger (JSONL audit sink)
 ├── stop.py              # StopController local stop file mechanism (STOP signal)
-├── cli/                 # User-facing CLI subcommands (chat, status, memory, stop)
-│   └── __init__.py
+├── cli/                 # User-facing CLI subcommands, theme, and streaming rendering
+│   ├── __init__.py
+│   ├── main.py          # CLI command parser, dispatch, and stream execution
+│   ├── theme.py         # AEGIS blue visual identity, theme tokens, headers, prefixes
+│   ├── render.py        # Safe incremental StreamBuffer, Markdown and plain renderers
+│   └── animations.py    # Capability-gated spinners, streaming indicators, completion
 ├── memory/              # Explicit SQLite-backed memory store
 │   └── __init__.py
 ├── provider/            # Local model provider (Ollama HTTP client over 127.0.0.1)

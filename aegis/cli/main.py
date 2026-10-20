@@ -7,11 +7,32 @@ import os
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from aegis.audit import JsonlAuditLogger, read_events
+from aegis.cli.animations import (
+    AnimatedCaps,
+    StreamIndicator,
+    ThinkingIndicator,
+    capabilities,
+    completion,
+)
+from aegis.cli.render import (
+    StreamBuffer,
+    render_markdown,
+    render_plain,
+    safe_width,
+)
+from aegis.cli.theme import (
+    header_info,
+    make_console,
+    print_assistant_prefix,
+    print_header,
+    print_user,
+)
 from aegis.config import AegisConfig, ensure_dirs
 from aegis.errors import AegisError, MemoryStoreError, StopRequested
 from aegis.interfaces import AuditEvent, MemoryRecord, ModelProvider
@@ -107,7 +128,7 @@ def _redact_argv_for_audit(argv: list[str]) -> list[str]:
                 redacted.append(argv[i + 1])
                 i += 2
                 continue
-        elif arg in ("--clear", "--help", "-h"):
+        elif arg in ("--clear", "--help", "-h", "--plain", "--no-color", "--tui", "--no-memory"):
             redacted.append(arg)
             i += 1
             continue
@@ -153,21 +174,32 @@ def _build_parser() -> _AegisArgumentParser:
         prog="aegis",
         description="Project AEGIS - Autonomous Local Assistant",
     )
+    # Global flags
+    parser.add_argument("--plain", action="store_true", help="Plain text output without color or formatting")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # chat
     chat_parser = subparsers.add_parser("chat", help="Start chat session or single-shot prompt")
-    chat_parser.add_argument("--prompt", type=str, default=None, help="Single-shot prompt")
-    chat_parser.add_argument("--model", type=str, default=None, help="Model override")
-    chat_parser.add_argument("--system", type=str, default=None, help="System prompt")
+    chat_parser.add_argument("--prompt", "-p", type=str, default=None, help="Single-shot prompt")
+    chat_parser.add_argument("--model", "-m", type=str, default=None, help="Model override")
+    chat_parser.add_argument("--system", "-s", type=str, default=None, help="System prompt")
     chat_parser.add_argument("--no-memory", action="store_true", help="Disable memory")
     chat_parser.add_argument("--max-turns", type=int, default=None, help="Max turns in chat session")
+    chat_parser.add_argument("--plain", action="store_true", help="Plain text output without color or formatting")
+    chat_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    chat_parser.add_argument("--tui", action="store_true", help="Launch interactive Textual TUI")
 
     # status
-    subparsers.add_parser("status", help="Show system status")
+    status_parser = subparsers.add_parser("status", help="Show system status")
+    status_parser.add_argument("--plain", action="store_true", help="Plain text output")
+    status_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     # memory
     mem_parser = subparsers.add_parser("memory", help="Memory management commands")
+    mem_parser.add_argument("--plain", action="store_true", help="Plain text output")
+    mem_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     mem_sub = mem_parser.add_subparsers(dest="memory_action", required=True)
 
     # memory save
@@ -175,23 +207,33 @@ def _build_parser() -> _AegisArgumentParser:
     mem_save.add_argument("text", type=str, help="Memory text content")
     mem_save.add_argument("--tag", "-t", action="extend", nargs="+", default=[], help="Tag(s)")
     mem_save.add_argument("--source", "-s", type=str, default=None, help="Source metadata")
+    mem_save.add_argument("--plain", action="store_true", help="Plain text output")
+    mem_save.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     # memory search
     mem_search = mem_sub.add_parser("search", help="Search memory records")
     mem_search.add_argument("query", type=str, help="Search query")
     mem_search.add_argument("--limit", "-n", type=int, default=None, help="Maximum results")
+    mem_search.add_argument("--plain", action="store_true", help="Plain text output")
+    mem_search.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     # memory list
     mem_list = mem_sub.add_parser("list", help="List recent memory records")
     mem_list.add_argument("--limit", "-n", type=int, default=None, help="Maximum results")
+    mem_list.add_argument("--plain", action="store_true", help="Plain text output")
+    mem_list.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     # memory delete
     mem_delete = mem_sub.add_parser("delete", help="Delete a memory record")
     mem_delete.add_argument("record_id", type=str, help="Record ID to delete")
+    mem_delete.add_argument("--plain", action="store_true", help="Plain text output")
+    mem_delete.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     # stop
     stop_parser = subparsers.add_parser("stop", help="Request or clear stop signal")
     stop_parser.add_argument("--clear", action="store_true", help="Clear stop signal")
+    stop_parser.add_argument("--plain", action="store_true", help="Plain text output")
+    stop_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
 
     return parser
 
@@ -228,6 +270,12 @@ def main(
                 allow_network=config.allow_network,
             )
 
+        is_plain = getattr(args, "plain", False)
+        is_no_color = getattr(args, "no_color", False) or ("NO_COLOR" in os.environ)
+        console = make_console(plain=is_plain)
+        if is_no_color:
+            console.no_color = True
+
         audit = JsonlAuditLogger(config.audit_log)
         try:
             # Audit the invocation with redaction
@@ -245,13 +293,13 @@ def main(
 
             # Dispatch command
             if args.subcommand == "chat":
-                return _handle_chat(args, provider=provider, config=config)
+                return _handle_chat(args, provider=provider, config=config, console=console, is_plain=is_plain)
             elif args.subcommand == "status":
-                return _handle_status(provider=provider, config=config)
+                return _handle_status(args, provider=provider, config=config, console=console)
             elif args.subcommand == "memory":
-                return _handle_memory(args, config=config)
+                return _handle_memory(args, config=config, console=console)
             elif args.subcommand == "stop":
-                return _handle_stop(args, config=config)
+                return _handle_stop(args, config=config, console=console)
             else:
                 sys.stderr.write(f"Unknown subcommand: {args.subcommand}\n")
                 return 2
@@ -262,27 +310,142 @@ def main(
         return 2
 
 
-def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: AegisConfig) -> int:
+def _stream_response(
+    prompt: str,
+    *,
+    provider: ModelProvider,
+    config: AegisConfig,
+    model: str | None,
+    system: str | None,
+    stop_ctrl: StopController,
+    console: Console,
+    caps: AnimatedCaps,
+    is_plain: bool,
+) -> int:
+    target_model = model or config.model
+    buf = StreamBuffer()
+    stream_ind = StreamIndicator(console, caps)
+    thinking = ThinkingIndicator(console, caps)
+    chunk_count = 0
+    t0 = time.monotonic()
+    first_chunk = True
+    last_chunk = ""
+
+    try:
+        with thinking:
+            if hasattr(provider, "generate_stream"):
+                stream_iter = provider.generate_stream(
+                    prompt,
+                    system=system,
+                    model=target_model,
+                    stop_check=stop_ctrl.check,
+                )
+            else:
+                try:
+                    res = provider.generate(
+                        prompt,
+                        system=system,
+                        model=target_model,
+                        stop_check=stop_ctrl.check,
+                    )
+                except TypeError:
+                    res = provider.generate(
+                        prompt,
+                        system=system,
+                        model=target_model,
+                    )
+                stream_iter = iter([res])
+
+            for chunk in stream_iter:
+                if first_chunk:
+                    thinking.stop()
+                    first_chunk = False
+                    if not is_plain and console.is_terminal and not console.no_color:
+                        print_assistant_prefix(console)
+                    stream_ind.start()
+
+                chunk_count += 1
+                last_chunk = chunk
+                elapsed = time.monotonic() - t0
+                stream_ind.update(chunks=chunk_count, elapsed=elapsed)
+
+                if is_plain:
+                    render_plain(console, chunk)
+                else:
+                    ready = buf.feed(chunk)
+                    if ready:
+                        render_markdown(console, ready)
+
+        thinking.stop()
+        stream_ind.stop()
+
+        if is_plain:
+            if chunk_count > 0 and not last_chunk.endswith("\n"):
+                console.print()
+            else:
+                try:
+                    console.file.flush()
+                except Exception:
+                    pass
+        else:
+            remaining = buf.flush()
+            if remaining:
+                render_markdown(console, remaining)
+
+        elapsed = time.monotonic() - t0
+        completion(console, caps, elapsed, chunk_count)
+        return 0
+    except KeyboardInterrupt:
+        thinking.stop()
+        stream_ind.stop()
+        print("\n[Stop requested by user]")
+        return 130
+    except StopRequested as e:
+        thinking.stop()
+        stream_ind.stop()
+        print(f"\n[Operation stopped: {e}]", file=sys.stderr)
+        return 130
+
+
+def _handle_chat(
+    args: argparse.Namespace,
+    *,
+    provider: ModelProvider,
+    config: AegisConfig,
+    console: Console | None = None,
+    is_plain: bool = False,
+) -> int:
+    if console is None:
+        console = make_console(plain=is_plain)
+
+    if getattr(args, "tui", False):
+        try:
+            from aegis.cli.tui import run_tui
+            return run_tui(config, provider, model=args.model)
+        except ImportError:
+            sys.stderr.write("Error: Textual TUI is not installed. Install with: pip install 'aegis-ai[tui]'\n")
+            return 2
+
+    caps = capabilities(console, plain=is_plain)
     stop_ctrl = StopController(config.stop_file)
 
     if args.prompt is not None:
         try:
             stop_ctrl.check()
-            try:
-                answer = provider.generate(
-                    args.prompt,
-                    system=args.system,
-                    model=args.model,
-                    stop_check=stop_ctrl.check,
-                )
-            except TypeError:
-                answer = provider.generate(
-                    args.prompt,
-                    system=args.system,
-                    model=args.model,
-                )
-            print(answer)
-            return 0
+            if not is_plain:
+                print_header(console, config, args.model)
+            rc = _stream_response(
+                args.prompt,
+                provider=provider,
+                config=config,
+                model=args.model,
+                system=args.system,
+                stop_ctrl=stop_ctrl,
+                console=console,
+                caps=caps,
+                is_plain=is_plain,
+            )
+            return rc
         except KeyboardInterrupt:
             print("\n[Stop requested by user]")
             return 130
@@ -293,7 +456,15 @@ def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: A
     # Interactive REPL
     max_turns = args.max_turns if args.max_turns is not None else config.max_chat_turns
     turn = 0
-    print(f"AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit")
+    if not is_plain:
+        print_header(console, config, args.model)
+        if console.is_terminal and not console.no_color:
+            console.print(f"[aegis.muted]AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit[/aegis.muted]")
+        else:
+            print(f"AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit")
+    else:
+        print(f"AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit")
+
     try:
         while turn < max_turns:
             stop_ctrl.check()
@@ -310,28 +481,19 @@ def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: A
                 continue
 
             turn += 1
-            try:
-                try:
-                    response = provider.generate(
-                        stripped,
-                        system=args.system,
-                        model=args.model,
-                        stop_check=stop_ctrl.check,
-                    )
-                except TypeError:
-                    response = provider.generate(
-                        stripped,
-                        system=args.system,
-                        model=args.model,
-                    )
-            except KeyboardInterrupt:
-                print("\n[Stop requested by user]")
-                return 130
-            except StopRequested as e:
-                print(f"\n[Operation stopped: {e}]", file=sys.stderr)
-                return 130
-
-            print(response)
+            rc = _stream_response(
+                stripped,
+                provider=provider,
+                config=config,
+                model=args.model,
+                system=args.system,
+                stop_ctrl=stop_ctrl,
+                console=console,
+                caps=caps,
+                is_plain=is_plain,
+            )
+            if rc != 0:
+                return rc
             stop_ctrl.check()
     except KeyboardInterrupt:
         print("\n[Stop requested by user]")
@@ -340,7 +502,16 @@ def _handle_chat(args: argparse.Namespace, *, provider: ModelProvider, config: A
     return 0
 
 
-def _handle_status(*, provider: ModelProvider, config: AegisConfig) -> int:
+def _handle_status(
+    args: argparse.Namespace | None = None,
+    *,
+    provider: ModelProvider,
+    config: AegisConfig,
+    console: Console | None = None,
+) -> int:
+    if console is None:
+        console = make_console()
+
     is_healthy = provider.health()
     available_models: list[str] = []
     if is_healthy:
@@ -376,54 +547,79 @@ def _handle_status(*, provider: ModelProvider, config: AegisConfig) -> int:
     else:
         stop_state = "clear"
 
-    print(f"Model: {config.model}")
-    print(f"Ollama Host: {config.ollama_host}")
-    print(f"Provider Health: {is_healthy}")
-    print(f"Available Models: {available_models}")
-    print(f"Memory DB: {config.memory_db} ({count} records)")
-    print(f"Audit Log: {config.audit_log} (last event: {last_event_str})")
-    print(f"Stop State: {stop_state}")
+    if console.no_color:
+        console.print(f"Model: {config.model}")
+        console.print(f"Ollama Host: {config.ollama_host}")
+        console.print(f"Provider Health: {is_healthy}")
+        console.print(f"Available Models: {available_models}")
+        console.print(f"Memory DB: {config.memory_db} ({count} records)")
+        console.print(f"Audit Log: {config.audit_log} (last event: {last_event_str})")
+        console.print(f"Stop State: {stop_state}")
+    else:
+        console.print(f"[aegis.accent]Model:[/aegis.accent] {config.model}")
+        console.print(f"[aegis.accent]Ollama Host:[/aegis.accent] {config.ollama_host}")
+        health_style = "aegis.success" if is_healthy else "aegis.error"
+        console.print(f"[aegis.accent]Provider Health:[/aegis.accent] [{health_style}]{is_healthy}[/{health_style}]")
+        console.print(f"[aegis.accent]Available Models:[/aegis.accent] {available_models}")
+        console.print(f"[aegis.accent]Memory DB:[/aegis.accent] {config.memory_db} ({count} records)")
+        console.print(f"[aegis.accent]Audit Log:[/aegis.accent] {config.audit_log} (last event: {last_event_str})")
+        stop_style = "aegis.error" if stop_ctrl.is_stopped() else "aegis.success"
+        console.print(f"[aegis.accent]Stop State:[/aegis.accent] [{stop_style}]{stop_state}[/{stop_style}]")
 
     return 0 if is_healthy else 1
 
 
-def _handle_memory(args: argparse.Namespace, *, config: AegisConfig) -> int:
+def _handle_memory(
+    args: argparse.Namespace,
+    *,
+    config: AegisConfig,
+    console: Console | None = None,
+) -> int:
+    if console is None:
+        console = make_console()
+
     store = _get_memory_store(config.memory_db)
     try:
         if args.memory_action == "save":
             rec = store.save(args.text, tags=args.tag or (), source=args.source)
-            print(f"Saved memory [{rec.id}]")
+            if console.no_color:
+                console.print(f"Saved memory [{rec.id}]")
+            else:
+                console.print(f"[aegis.success]Saved memory[/aegis.success] [{rec.id}]")
             return 0
         elif args.memory_action == "search":
             limit = args.limit if args.limit is not None else config.max_memory_results
             limit = min(max(1, limit), config.max_memory_results)
             records = store.search(args.query, limit=limit)
             if not records:
-                print("No memories found.")
+                console.print("No memories found.")
             else:
                 for r in records:
                     tag_str = f" tags={list(r.tags)}" if r.tags else ""
                     src_str = f" source={r.source}" if r.source else ""
-                    print(f"[{r.id}] {r.content}{tag_str}{src_str}")
+                    console.print(f"[{r.id}] {r.content}{tag_str}{src_str}")
             return 0
         elif args.memory_action == "list":
             limit = args.limit if args.limit is not None else config.max_memory_results
             limit = min(max(1, limit), config.max_memory_results)
             records = store.list(limit=limit)
             if not records:
-                print("No memories stored.")
+                console.print("No memories stored.")
             else:
                 for r in records:
                     tag_str = f" tags={list(r.tags)}" if r.tags else ""
                     src_str = f" source={r.source}" if r.source else ""
-                    print(f"[{r.id}] {r.content}{tag_str}{src_str}")
+                    console.print(f"[{r.id}] {r.content}{tag_str}{src_str}")
             return 0
         elif args.memory_action == "delete":
             deleted = store.delete(args.record_id)
             if deleted:
-                print(f"Deleted memory [{args.record_id}]")
+                if console.no_color:
+                    console.print(f"Deleted memory [{args.record_id}]")
+                else:
+                    console.print(f"[aegis.success]Deleted memory[/aegis.success] [{args.record_id}]")
             else:
-                print(f"Memory record not found: {args.record_id}")
+                console.print(f"Memory record not found: {args.record_id}")
             return 0
         else:
             sys.stderr.write(f"Unknown memory action: {args.memory_action}\n")
@@ -432,12 +628,26 @@ def _handle_memory(args: argparse.Namespace, *, config: AegisConfig) -> int:
         store.close()
 
 
-def _handle_stop(args: argparse.Namespace, *, config: AegisConfig) -> int:
+def _handle_stop(
+    args: argparse.Namespace,
+    *,
+    config: AegisConfig,
+    console: Console | None = None,
+) -> int:
+    if console is None:
+        console = make_console()
+
     stop_ctrl = StopController(config.stop_file)
     if args.clear:
         stop_ctrl.clear()
-        print("Stop state cleared")
+        if console.no_color:
+            console.print("Stop state cleared")
+        else:
+            console.print("[aegis.success]Stop state cleared[/aegis.success]")
     else:
         stop_ctrl.request_stop("user")
-        print("Stop requested")
+        if console.no_color:
+            console.print("Stop requested")
+        else:
+            console.print("[aegis.warning]Stop requested[/aegis.warning]")
     return 0
