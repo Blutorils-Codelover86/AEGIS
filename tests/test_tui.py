@@ -21,6 +21,8 @@ try:
     from aegis.cli.tui import AegisTUI, TEXTUAL_AVAILABLE, run_tui
 except ImportError:
     TEXTUAL_AVAILABLE = False
+    from aegis.cli.tui import TEXTUAL_AVAILABLE, run_tui
+    AegisTUI = None  # type: ignore[assignment,misc]
 
 
 class FakeStreamingProvider:
@@ -85,7 +87,101 @@ class TestTUIFallbackAndGuard(unittest.TestCase):
             provider = FakeStreamingProvider()
             with self.assertRaises(ImportError) as ctx:
                 run_tui(self.config, provider)
-            self.assertIn("pip install 'aegis-ai[tui]'", str(ctx.exception))
+            self.assertIn('pip install "aegis-ai[tui]"', str(ctx.exception))
+
+    def test_subprocess_import_and_run_tui_without_textual(self) -> None:
+        """When textual is blocked in sys.modules, importing aegis.cli.tui succeeds and run_tui raises ImportError."""
+        import subprocess
+        code = """
+import sys
+sys.modules['textual'] = None
+sys.modules['textual.app'] = None
+sys.modules['textual.binding'] = None
+sys.modules['textual.containers'] = None
+sys.modules['textual.widgets'] = None
+
+import aegis.cli.tui as tui
+assert not tui.TEXTUAL_AVAILABLE, 'TEXTUAL_AVAILABLE should be False'
+assert tui.AegisTUI is None, 'AegisTUI should be None'
+
+from aegis.config import AegisConfig
+class FakeP:
+    pass
+
+try:
+    tui.run_tui(AegisConfig(), FakeP())
+    print('NO_EXCEPTION')
+except ImportError as e:
+    assert 'pip install "aegis-ai[tui]"' in str(e), f"Unexpected message: {e}"
+    print('EXPECTED_IMPORT_ERROR')
+"""
+        res = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("EXPECTED_IMPORT_ERROR", res.stdout)
+
+    def test_pty_cli_tui_fallback_without_textual(self) -> None:
+        """When textual is blocked in a real TTY, aegis chat --tui falls back cleanly with exit 0 and no traceback."""
+        import pty
+        import subprocess
+
+        master, slave = pty.openpty()
+        code = f"""
+import sys
+sys.modules['textual'] = None
+sys.modules['textual.app'] = None
+sys.modules['textual.binding'] = None
+sys.modules['textual.containers'] = None
+sys.modules['textual.widgets'] = None
+
+from aegis.cli.main import main
+from aegis.config import AegisConfig
+
+class FakeProvider:
+    name = "fake"
+    def generate_stream(self, prompt, **kwargs):
+        yield "Fake TTY response"
+    def health(self):
+        return True
+    def list_models(self):
+        return ["fake:1b"]
+
+cfg = AegisConfig(
+    audit_log={repr(self.config.audit_log)},
+    memory_db={repr(self.config.memory_db)},
+    stop_file={repr(self.config.stop_file)},
+)
+rc = main(["chat", "--tui", "--prompt", "hi"], config=cfg, provider=FakeProvider())
+sys.exit(rc)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+        )
+        os.close(slave)
+        out = b""
+        while True:
+            try:
+                data = os.read(master, 1024)
+                if not data:
+                    break
+                out += data
+            except OSError:
+                break
+        os.close(master)
+
+        text_out = out.decode("utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 0, f"Process exited with {proc.returncode}. Output:\n{text_out}")
+        self.assertNotIn("Traceback", text_out)
+        self.assertNotIn("NameError", text_out)
+        self.assertIn("Textual TUI is not installed", text_out)
+        self.assertIn("Fake TTY response", text_out)
 
     def test_cli_fallback_when_not_tty(self) -> None:
         """When stdout is not a TTY, --tui prints fallback warning and uses Rich streaming."""
