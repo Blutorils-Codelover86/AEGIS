@@ -507,6 +507,8 @@ def _handle_chat(
     if args.prompt is not None:
         try:
             stop_ctrl.check()
+            if not is_plain:
+                print_header(console, config, args.model)
             conv = Conversation(max_turns=1)
             conv.add_user(args.prompt)
             rc = _stream_response(
@@ -535,6 +537,7 @@ def _handle_chat(
     conversation = Conversation(max_turns=resolved_max_turns)
     turn = 0
     if not is_plain:
+        print_header(console, config, args.model)
         if console.is_terminal and not console.no_color:
             console.print(f"[aegis.muted]AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit[/aegis.muted]")
         else:

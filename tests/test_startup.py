@@ -9,7 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Callable, Iterator, Mapping, Sequence
 from unittest.mock import MagicMock, patch
 
-from aegis.cli.main import _build_parser, main
+from aegis.cli.main import _build_parser, _handle_chat, main
 from aegis.cli.startup import CheckState, StartupCheck, StartupReport, run_startup
 from aegis.cli.theme import make_console
 from aegis.config import AegisConfig
@@ -184,6 +184,7 @@ class TestStartup(unittest.TestCase):
             animation=True,
             env={},
         )
+        self.assertGreaterEqual(report.elapsed, 1.0)
         self.assertLess(report.elapsed, 2.5)
         # Should include shield emblem in animated terminal mode
         self.assertIn("AEGIS", out.getvalue())
@@ -339,6 +340,52 @@ class TestStartupCLIRegression(unittest.TestCase):
                 )
             self.assertEqual(rc, 0)
             self.assertEqual(mock_startup.call_count, 1)
+
+    def test_header_single_shot_non_plain(self) -> None:
+        """Header appears exactly once in non-plain single-shot chat."""
+        provider = FakeStartupProvider()
+        out = io.StringIO()
+        console = make_console(force_terminal=True, file=out)
+        args = _build_parser().parse_args(["chat", "--prompt", "hi", "--no-animation"])
+
+        rc = _handle_chat(args, provider=provider, config=self.config, console=console, is_plain=False)
+        self.assertEqual(rc, 0)
+        output = out.getvalue()
+        self.assertEqual(output.count("AEGIS · qwen2.5-coder:1.5b · local"), 1)
+
+    def test_header_interactive_non_plain(self) -> None:
+        """Header appears exactly once in non-plain interactive chat."""
+        provider = FakeStartupProvider()
+        out = io.StringIO()
+        console = make_console(force_terminal=True, file=out)
+        args = _build_parser().parse_args(["chat", "--no-animation", "--max-turns", "1"])
+
+        with patch("builtins.input", side_effect=EOFError):
+            rc = _handle_chat(args, provider=provider, config=self.config, console=console, is_plain=False)
+        self.assertEqual(rc, 0)
+        output = out.getvalue()
+        self.assertEqual(output.count("AEGIS · qwen2.5-coder:1.5b · local"), 1)
+
+    def test_header_absent_in_plain_mode(self) -> None:
+        """Header is absent in plain mode for single-shot and interactive chat."""
+        provider = FakeStartupProvider()
+
+        # Single-shot
+        out1 = io.StringIO()
+        console1 = make_console(plain=True, file=out1)
+        args1 = _build_parser().parse_args(["chat", "--prompt", "hi", "--plain", "--no-animation"])
+        rc1 = _handle_chat(args1, provider=provider, config=self.config, console=console1, is_plain=True)
+        self.assertEqual(rc1, 0)
+        self.assertEqual(out1.getvalue().count("AEGIS · qwen2.5-coder:1.5b · local"), 0)
+
+        # Interactive
+        out2 = io.StringIO()
+        console2 = make_console(plain=True, file=out2)
+        args2 = _build_parser().parse_args(["chat", "--plain", "--no-animation", "--max-turns", "1"])
+        with patch("builtins.input", side_effect=EOFError):
+            rc2 = _handle_chat(args2, provider=provider, config=self.config, console=console2, is_plain=True)
+        self.assertEqual(rc2, 0)
+        self.assertEqual(out2.getvalue().count("AEGIS · qwen2.5-coder:1.5b · local"), 0)
 
 
 if __name__ == "__main__":

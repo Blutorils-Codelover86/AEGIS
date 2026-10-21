@@ -97,7 +97,16 @@ def run_startup(
     t0 = time.monotonic()
     checks: list[StartupCheck] = []
     animate = _should_animate(console, plain, animation, env)
-    deadline = t0 + 1.8  # Max 1.8s delay budget for animation
+    deadline = t0 + 2.0  # Max delay budget for animation
+
+    def _animate_delay(delay: float) -> None:
+        if stop_ctrl is not None and stop_ctrl.is_stopped():
+            return
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0.02:
+            return
+        time.sleep(min(delay, remaining))
 
     # 1. Identity Check
     try:
@@ -305,10 +314,12 @@ def run_startup(
 
     # Presentation Rendering
     if animate:
-        # 1. Print Shield Emblem
+        # 1. Subtle scan/reveal sequence of shield emblem lines
         for line in SHIELD_EMBLEM:
             console.print(line)
+            _animate_delay(0.08)
         console.print()
+        _animate_delay(0.12)
 
         # 2. Render each check line with scanning reveal
         state_markers = {
@@ -319,14 +330,12 @@ def run_startup(
             CheckState.SKIPPED: ("[aegis.muted]○[/aegis.muted]", "[aegis.muted]skipped[/aegis.muted]"),
         }
 
-        for i, chk in enumerate(checks):
+        for chk in checks:
             icon, state_txt = state_markers[chk.state]
             console.print(f" {icon}  [bold #94A3B8]{chk.label:<16}[/] {state_txt:<24} [aegis.muted]{chk.detail}[/]")
-            # Scan delay if time remaining
-            remaining = deadline - time.monotonic()
-            if remaining > 0.05:
-                time.sleep(0.04)
+            _animate_delay(0.15)
         console.print()
+        _animate_delay(0.05)
 
     elif plain:
         # Plain mode: concise text, zero ANSI
