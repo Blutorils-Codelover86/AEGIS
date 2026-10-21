@@ -239,6 +239,7 @@ Input:focus {
         def _generate_stream_task(self, md_widget: Markdown, tail_widget: Static, prompt: str) -> None:
             buf = StreamBuffer()
             accum_stable = ""
+            raw_parts: list[str] = []
             first = True
             try:
                 self._check_stop()
@@ -252,6 +253,7 @@ Input:focus {
                     for chunk in stream:
                         if self._stop_event.is_set():
                             break
+                        raw_parts.append(chunk)
                         if first:
                             first = False
                             self.call_from_thread(tail_widget.update, "")
@@ -273,6 +275,7 @@ Input:focus {
                     for chunk in stream:
                         if self._stop_event.is_set():
                             break
+                        raw_parts.append(chunk)
                         if first:
                             first = False
                             self.call_from_thread(tail_widget.update, "")
@@ -292,6 +295,7 @@ Input:focus {
                         model=self.model,
                         stop_check=self._check_stop,
                     )
+                    raw_parts.append(response)
                     accum_stable = response
                     self.call_from_thread(md_widget.update, accum_stable)
                     self.call_from_thread(tail_widget.update, "")
@@ -305,11 +309,11 @@ Input:focus {
                 self.call_from_thread(tail_widget.update, "")
                 self.call_from_thread(self._scroll_history)
 
-                if accum_stable:
-                    self.conversation.add_assistant(accum_stable)
+                full_assistant = "".join(raw_parts)
+                if full_assistant:
+                    self.conversation.add_assistant(full_assistant)
             except StopRequested as e:
-                if self.conversation._messages and self.conversation._messages[-1].role == "user":
-                    self.conversation._messages.pop()
+                self.conversation.discard_pending_user()
                 remaining = buf.flush()
                 if remaining:
                     accum_stable += remaining
@@ -321,8 +325,7 @@ Input:focus {
                 self.call_from_thread(md_widget.update, accum_stable)
                 self.call_from_thread(tail_widget.update, "")
             except Exception as exc:
-                if self.conversation._messages and self.conversation._messages[-1].role == "user":
-                    self.conversation._messages.pop()
+                self.conversation.discard_pending_user()
                 self.call_from_thread(self._post_error, str(exc))
             finally:
                 self._generating = False

@@ -61,6 +61,11 @@ class Conversation:
         """Clear all conversation history."""
         self._messages.clear()
 
+    def discard_pending_user(self) -> None:
+        """Remove a trailing user message if it has received no assistant reply. No-op otherwise."""
+        if self._messages and self._messages[-1].role == "user":
+            self._messages.pop()
+
     def __len__(self) -> int:
         """Return the number of completed (user, assistant) turns."""
         count = 0

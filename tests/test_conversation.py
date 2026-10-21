@@ -127,6 +127,44 @@ class TestConversation(unittest.TestCase):
         msgs.append({"role": "user", "content": "injected"})
         self.assertEqual(len(conv.messages()), 1)
 
+    def test_discard_pending_user(self) -> None:
+        """discard_pending_user removes trailing user without assistant, and no-ops otherwise."""
+        conv = Conversation()
+
+        # 1. On empty conversation: no-op
+        conv.discard_pending_user()
+        self.assertEqual(len(conv.messages()), 0)
+
+        # 2. On pending user message: removes it
+        conv.add_user("pending question")
+        self.assertEqual(len(conv.messages()), 1)
+        conv.discard_pending_user()
+        self.assertEqual(len(conv.messages()), 0)
+
+        # 3. On completed turn (user + assistant): does not remove completed messages
+        conv.add_user("user turn 1")
+        conv.add_assistant("assistant reply 1")
+        self.assertEqual(len(conv.messages()), 2)
+        conv.discard_pending_user()
+        self.assertEqual(len(conv.messages()), 2)
+
+        # 4. On completed turn + pending user: removes only the pending user
+        conv.add_user("interrupted user turn")
+        self.assertEqual(len(conv.messages()), 3)
+        conv.discard_pending_user()
+        self.assertEqual(len(conv.messages()), 2)
+        self.assertEqual(
+            conv.messages(),
+            [
+                {"role": "user", "content": "user turn 1"},
+                {"role": "assistant", "content": "assistant reply 1"},
+            ],
+        )
+
+        # Repeated call is safe no-op
+        conv.discard_pending_user()
+        self.assertEqual(len(conv.messages()), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

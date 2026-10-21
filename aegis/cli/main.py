@@ -427,8 +427,8 @@ def _stream_response(
             remaining = buf.flush()
             if remaining:
                 render_plain(console, remaining)
-        if conversation is not None and conversation._messages and conversation._messages[-1].role == "user":
-            conversation._messages.pop()
+        if conversation is not None:
+            conversation.discard_pending_user()
         print("\n[Stop requested by user]")
         return 130
     except StopRequested as e:
@@ -438,8 +438,8 @@ def _stream_response(
             remaining = buf.flush()
             if remaining:
                 render_plain(console, remaining)
-        if conversation is not None and conversation._messages and conversation._messages[-1].role == "user":
-            conversation._messages.pop()
+        if conversation is not None:
+            conversation.discard_pending_user()
         print(f"\n[Operation stopped: {e}]", file=sys.stderr)
         return 130
 

@@ -541,3 +541,60 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             app.action_clear_history()
             self.assertEqual(len(app.conversation), 0)
             self.assertEqual(app.conversation.messages(), [])
+
+    async def test_pilot_multi_turn_continuity_with_pending_tail(self) -> None:
+        """Verify TUI conversation continuity preserves raw reply when stream ends with pending markdown tail."""
+        from aegis.identity import identity_system_prompt
+
+        raw_turn1_chunks = ["Result: `code` and ", "unclosed `tail"]
+        full_turn1_raw = "".join(raw_turn1_chunks)
+
+        provider = FakeMultiTurnChatProvider([
+            raw_turn1_chunks,
+            ["Turn 2 response."],
+        ])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            # Turn 1
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "Format test prompt"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 1:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 1)
+
+            # Turn 2
+            inp.value = "Followup question"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 2)
+            turn2_messages = provider.chat_stream_calls[1]
+            self.assertEqual(len(turn2_messages), 4)
+
+            # Assert system message is the identity prompt for the selected model
+            expected_system = identity_system_prompt(model="test-model:1b")
+            self.assertEqual(turn2_messages[0]["role"], "system")
+            self.assertEqual(turn2_messages[0]["content"], expected_system)
+
+            # Assert user 1
+            self.assertEqual(turn2_messages[1], {"role": "user", "content": "Format test prompt"})
+
+            # Assert turn 2 receives assistant message whose content equals full raw reply
+            self.assertEqual(turn2_messages[2]["role"], "assistant")
+            self.assertEqual(turn2_messages[2]["content"], full_turn1_raw)
+            self.assertTrue(turn2_messages[2]["content"].endswith("unclosed `tail"))
+
+            # Assert user 2
+            self.assertEqual(turn2_messages[3], {"role": "user", "content": "Followup question"})
