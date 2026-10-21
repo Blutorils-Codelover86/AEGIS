@@ -26,6 +26,7 @@ from aegis.cli.render import (
     render_plain,
     safe_width,
 )
+from aegis.cli.startup import run_startup
 from aegis.cli.theme import (
     header_info,
     make_console,
@@ -179,6 +180,7 @@ def _build_parser() -> _AegisArgumentParser:
     # Global flags
     parser.add_argument("--plain", action="store_true", help="Plain text output without color or formatting")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+    parser.add_argument("--no-animation", action="store_true", help="Disable startup animation")
 
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
@@ -191,12 +193,14 @@ def _build_parser() -> _AegisArgumentParser:
     chat_parser.add_argument("--max-turns", type=int, default=None, help="Max turns in chat session")
     chat_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output without color or formatting")
     chat_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
+    chat_parser.add_argument("--no-animation", action="store_true", default=argparse.SUPPRESS, help="Disable startup animation")
     chat_parser.add_argument("--tui", action="store_true", help="Launch interactive Textual TUI")
 
     # status
     status_parser = subparsers.add_parser("status", help="Show system status")
     status_parser.add_argument("--plain", action="store_true", default=argparse.SUPPRESS, help="Plain text output")
     status_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS, help="Disable colored output")
+    status_parser.add_argument("--no-animation", action="store_true", default=argparse.SUPPRESS, help="Disable startup animation")
 
     # memory
     mem_parser = subparsers.add_parser("memory", help="Memory management commands")
@@ -456,6 +460,27 @@ def _handle_chat(
         console = make_console(plain=is_plain)
 
     target_model = args.model or config.model
+    stop_ctrl = StopController(config.stop_file)
+
+    allow_animation = not getattr(args, "no_animation", False)
+    try:
+        report = run_startup(
+            console,
+            config,
+            provider,
+            model=target_model,
+            plain=is_plain,
+            animation=allow_animation,
+            stop_ctrl=stop_ctrl,
+        )
+    except KeyboardInterrupt:
+        print("\n[Stop requested by user]")
+        return 130
+
+    if report.stop_requested:
+        print(f"\n[Operation stopped: stop requested via {config.stop_file}]", file=sys.stderr)
+        return 130
+
     system_text = identity_system_prompt(model=target_model, user_system=args.system)
     system_msg = {"role": "system", "content": system_text}
 
@@ -478,13 +503,10 @@ def _handle_chat(
                 sys.stderr.write(f"Textual TUI is not installed ({err}). Falling back to terminal chat. Install with: pip install 'aegis-ai[tui]'\n")
 
     caps = capabilities(console, plain=is_plain)
-    stop_ctrl = StopController(config.stop_file)
 
     if args.prompt is not None:
         try:
             stop_ctrl.check()
-            if not is_plain:
-                print_header(console, config, args.model)
             conv = Conversation(max_turns=1)
             conv.add_user(args.prompt)
             rc = _stream_response(
@@ -513,7 +535,6 @@ def _handle_chat(
     conversation = Conversation(max_turns=resolved_max_turns)
     turn = 0
     if not is_plain:
-        print_header(console, config, args.model)
         if console.is_terminal and not console.no_color:
             console.print(f"[aegis.muted]AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit[/aegis.muted]")
         else:
