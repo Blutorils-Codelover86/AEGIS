@@ -8,7 +8,9 @@ from typing import Any, Callable, Sequence
 from aegis.cli.render import StreamBuffer
 from aegis.cli.theme import ACCENT, header_info
 from aegis.config import AegisConfig
+from aegis.conversation import Conversation, format_conversation_prompt
 from aegis.errors import AegisError, StopRequested
+from aegis.identity import identity_system_prompt
 from aegis.interfaces import ModelProvider
 from aegis.stop import StopController
 
@@ -146,6 +148,7 @@ Input:focus {
             system: str | None = None,
             initial_prompt: str | None = None,
             no_memory: bool = False,
+            max_turns: int | None = None,
         ) -> None:
             super().__init__()
             self.config = config
@@ -157,6 +160,12 @@ Input:focus {
             self.stop_ctrl = StopController(config.stop_file)
             self._stop_event = threading.Event()
             self._generating = False
+            self._active_generation_id = 0
+
+            resolved_max_turns = max_turns if max_turns is not None else config.max_chat_turns
+            self.conversation = Conversation(max_turns=resolved_max_turns)
+            self.system_prompt_str = identity_system_prompt(model=self.model, user_system=self.system)
+            self.system_message = {"role": "system", "content": self.system_prompt_str}
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
@@ -202,6 +211,9 @@ Input:focus {
 
         async def _submit_prompt(self, prompt: str) -> None:
             self._generating = True
+            self._active_generation_id += 1
+            gen_id = self._active_generation_id
+            self.conversation.add_user(prompt)
             history = self.query_one("#chat-history", VerticalScroll)
 
             # Mount User Message
@@ -225,24 +237,54 @@ Input:focus {
             history.scroll_end(animate=False)
 
             # Run model stream worker in background thread
-            self.run_worker(lambda: self._generate_stream_task(asst_md, asst_tail, prompt), thread=True)
+            self.run_worker(lambda: self._generate_stream_task(asst_md, asst_tail, prompt, gen_id), thread=True)
 
-        def _generate_stream_task(self, md_widget: Markdown, tail_widget: Static, prompt: str) -> None:
+        def _generate_stream_task(self, md_widget: Markdown, tail_widget: Static, prompt: str, gen_id: int) -> None:
             buf = StreamBuffer()
             accum_stable = ""
+            raw_parts: list[str] = []
             first = True
             try:
                 self._check_stop()
-                if hasattr(self.provider, "generate_stream"):
-                    stream = self.provider.generate_stream(
-                        prompt,
-                        system=self.system,
+                if hasattr(self.provider, "chat_stream"):
+                    messages = [self.system_message] + self.conversation.messages()
+                    stream = self.provider.chat_stream(
+                        messages,
                         model=self.model,
                         stop_check=self._check_stop,
                     )
                     for chunk in stream:
-                        if self._stop_event.is_set():
+                        if self._stop_event.is_set() or gen_id != self._active_generation_id:
                             break
+                        raw_parts.append(chunk)
+                        if first:
+                            first = False
+                            self.call_from_thread(tail_widget.update, "")
+
+                        ready = buf.feed(chunk)
+                        if ready:
+                            accum_stable += ready
+                            self.call_from_thread(md_widget.update, accum_stable)
+                        pending = buf.pending
+                        self.call_from_thread(tail_widget.update, pending)
+                        self.call_from_thread(self._scroll_history)
+                elif hasattr(self.provider, "generate_stream"):
+                    effective_system = (
+                        self.system_message["content"]
+                        if (self.system_message and "content" in self.system_message)
+                        else self.system
+                    )
+                    effective_prompt = format_conversation_prompt(self.conversation, prompt)
+                    stream = self.provider.generate_stream(
+                        effective_prompt,
+                        system=effective_system,
+                        model=self.model,
+                        stop_check=self._check_stop,
+                    )
+                    for chunk in stream:
+                        if self._stop_event.is_set() or gen_id != self._active_generation_id:
+                            break
+                        raw_parts.append(chunk)
                         if first:
                             first = False
                             self.call_from_thread(tail_widget.update, "")
@@ -256,16 +298,28 @@ Input:focus {
                         self.call_from_thread(tail_widget.update, pending)
                         self.call_from_thread(self._scroll_history)
                 else:
+                    effective_system = (
+                        self.system_message["content"]
+                        if (self.system_message and "content" in self.system_message)
+                        else self.system
+                    )
+                    effective_prompt = format_conversation_prompt(self.conversation, prompt)
                     response = self.provider.generate(
-                        prompt,
-                        system=self.system,
+                        effective_prompt,
+                        system=effective_system,
                         model=self.model,
                         stop_check=self._check_stop,
                     )
+                    if gen_id != self._active_generation_id or self._stop_event.is_set():
+                        return
+                    raw_parts.append(response)
                     accum_stable = response
                     self.call_from_thread(md_widget.update, accum_stable)
                     self.call_from_thread(tail_widget.update, "")
                     self.call_from_thread(self._scroll_history)
+
+                if gen_id != self._active_generation_id:
+                    return
 
                 # End of stream: flush any remaining buffer to stable markdown
                 remaining = buf.flush()
@@ -274,22 +328,31 @@ Input:focus {
                     self.call_from_thread(md_widget.update, accum_stable)
                 self.call_from_thread(tail_widget.update, "")
                 self.call_from_thread(self._scroll_history)
+
+                full_assistant = "".join(raw_parts)
+                if full_assistant:
+                    self.conversation.add_assistant(full_assistant)
             except StopRequested as e:
-                remaining = buf.flush()
-                if remaining:
-                    accum_stable += remaining
-                stop_msg = f"*[Generation stopped: {e}]*"
-                if not accum_stable:
-                    accum_stable = stop_msg
-                else:
-                    accum_stable += f"\n\n{stop_msg}"
-                self.call_from_thread(md_widget.update, accum_stable)
-                self.call_from_thread(tail_widget.update, "")
+                if gen_id == self._active_generation_id:
+                    self.conversation.discard_pending_user()
+                    remaining = buf.flush()
+                    if remaining:
+                        accum_stable += remaining
+                    stop_msg = f"*[Generation stopped: {e}]*"
+                    if not accum_stable:
+                        accum_stable = stop_msg
+                    else:
+                        accum_stable += f"\n\n{stop_msg}"
+                    self.call_from_thread(md_widget.update, accum_stable)
+                    self.call_from_thread(tail_widget.update, "")
             except Exception as exc:
-                self.call_from_thread(self._post_error, str(exc))
+                if gen_id == self._active_generation_id:
+                    self.conversation.discard_pending_user()
+                    self.call_from_thread(self._post_error, str(exc))
             finally:
-                self._generating = False
-                self.call_from_thread(self._scroll_history)
+                if gen_id == self._active_generation_id:
+                    self._generating = False
+                    self.call_from_thread(self._scroll_history)
 
         def _check_stop(self) -> None:
             if self._stop_event.is_set():
@@ -310,6 +373,11 @@ Input:focus {
             self._scroll_history()
 
         def action_clear_history(self) -> None:
+            self._active_generation_id += 1
+            self._generating = False
+            self._stop_event.set()
+            self._stop_event = threading.Event()
+            self.conversation.clear()
             history = self.query_one("#chat-history", VerticalScroll)
             history.remove_children()
 
@@ -330,6 +398,7 @@ def run_tui(
     system: str | None = None,
     initial_prompt: str | None = None,
     no_memory: bool = False,
+    max_turns: int | None = None,
 ) -> int:
     """Launch the interactive Textual TUI.
 
@@ -347,6 +416,7 @@ def run_tui(
         system=system,
         initial_prompt=initial_prompt,
         no_memory=no_memory,
+        max_turns=max_turns,
     )
     app.run()
     return 0

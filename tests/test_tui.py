@@ -5,9 +5,10 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 from unittest.mock import MagicMock, patch
 
 from aegis.config import AegisConfig
@@ -56,6 +57,40 @@ class FakeStreamingProvider:
             if self.raise_stop:
                 raise StopRequested("Interrupted by test")
             yield chunk
+
+    def list_models(self) -> list[str]:
+        return ["fake-model:latest"]
+
+    def health(self) -> bool:
+        return True
+
+
+class FakeMultiTurnChatProvider:
+    """Mock provider with chat_stream multi-turn support for TUI testing."""
+
+    name = "fake-multiturn-chat"
+
+    def __init__(self, responses: Sequence[Sequence[str]]) -> None:
+        self.responses = list(responses)
+        self.chat_stream_calls: list[list[dict[str, str]]] = []
+        self._turn = 0
+
+    def chat_stream(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> Iterator[str]:
+        self.chat_stream_calls.append([dict(m) for m in messages])
+        idx = self._turn
+        self._turn += 1
+        chunks = self.responses[idx] if idx < len(self.responses) else ["Default answer"]
+        for c in chunks:
+            if stop_check:
+                stop_check()
+            yield c
 
     def list_models(self) -> list[str]:
         return ["fake-model:latest"]
@@ -289,7 +324,11 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test() as pilot:
-            await pilot.pause(0.25)
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
             history = app.query_one("#chat-history", VerticalScroll)
             md_widgets = list(history.query(Markdown))
             self.assertTrue(len(md_widgets) >= 1)
@@ -323,9 +362,13 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause(0.25)
             self.assertEqual(len(provider.kwargs_calls), 1)
-            self.assertEqual(
-                provider.kwargs_calls[0]["system"],
+            self.assertIn(
                 "You are an ethical assistant with strict boundaries.",
+                provider.kwargs_calls[0]["system"],
+            )
+            self.assertIn(
+                "AEGIS",
+                provider.kwargs_calls[0]["system"],
             )
 
     async def test_pilot_hostile_splits_and_partial_formatting(self) -> None:
@@ -442,3 +485,223 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             # Verify stop event was set
             self.assertTrue(app._stop_event.is_set())
+
+    async def test_pilot_multi_turn_identity_and_prior_turns(self) -> None:
+        """TUI chat_stream injects identity system prompt and maintains conversation history across turns."""
+        provider = FakeMultiTurnChatProvider([
+            ["I am AEGIS assistant."],
+            ["Paris is the capital of France."],
+        ])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            # Turn 1
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "Who are you?"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 1:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 1)
+            turn1_messages = provider.chat_stream_calls[0]
+            self.assertEqual(len(turn1_messages), 2)
+            self.assertEqual(turn1_messages[0]["role"], "system")
+            self.assertIn("AEGIS", turn1_messages[0]["content"])
+            self.assertIn("test-model:1b", turn1_messages[0]["content"])
+            self.assertEqual(turn1_messages[1], {"role": "user", "content": "Who are you?"})
+
+            # Turn 2
+            inp.value = "What is the capital of France?"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 2)
+            turn2_messages = provider.chat_stream_calls[1]
+            self.assertEqual(len(turn2_messages), 4)
+            self.assertEqual(turn2_messages[0]["role"], "system")
+            self.assertEqual(turn2_messages[1], {"role": "user", "content": "Who are you?"})
+            self.assertEqual(turn2_messages[2], {"role": "assistant", "content": "I am AEGIS assistant."})
+            self.assertEqual(turn2_messages[3], {"role": "user", "content": "What is the capital of France?"})
+
+            self.assertEqual(len(app.conversation), 2)
+
+    async def test_pilot_clear_history_clears_conversation(self) -> None:
+        """action_clear_history clears both the widget tree and the internal Conversation state."""
+        provider = FakeMultiTurnChatProvider([["Hello back!"]])
+        app = AegisTUI(self.config, provider, initial_prompt="Hello")
+
+        async with app.run_test() as pilot:
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(app.conversation), 1)
+            app.action_clear_history()
+            self.assertEqual(len(app.conversation), 0)
+            self.assertEqual(app.conversation.messages(), [])
+
+    async def test_pilot_multi_turn_continuity_with_pending_tail(self) -> None:
+        """Verify TUI conversation continuity preserves raw reply when stream ends with pending markdown tail."""
+        from aegis.identity import identity_system_prompt
+
+        raw_turn1_chunks = ["Result: `code` and ", "unclosed `tail"]
+        full_turn1_raw = "".join(raw_turn1_chunks)
+
+        provider = FakeMultiTurnChatProvider([
+            raw_turn1_chunks,
+            ["Turn 2 response."],
+        ])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            # Turn 1
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "Format test prompt"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 1:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 1)
+
+            # Turn 2
+            inp.value = "Followup question"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 2)
+            turn2_messages = provider.chat_stream_calls[1]
+            self.assertEqual(len(turn2_messages), 4)
+
+            # Assert system message is the identity prompt for the selected model
+            expected_system = identity_system_prompt(model="test-model:1b")
+            self.assertEqual(turn2_messages[0]["role"], "system")
+            self.assertEqual(turn2_messages[0]["content"], expected_system)
+
+            # Assert user 1
+            self.assertEqual(turn2_messages[1], {"role": "user", "content": "Format test prompt"})
+
+            # Assert turn 2 receives assistant message whose content equals full raw reply
+            self.assertEqual(turn2_messages[2]["role"], "assistant")
+            self.assertEqual(turn2_messages[2]["content"], full_turn1_raw)
+            self.assertTrue(turn2_messages[2]["content"].endswith("unclosed `tail"))
+
+            # Assert user 2
+            self.assertEqual(turn2_messages[3], {"role": "user", "content": "Followup question"})
+
+    async def test_pilot_legacy_generate_stream_continuity(self) -> None:
+        """Verify TUI legacy provider (generate_stream only) receives composed identity and multi-turn context."""
+        provider = FakeStreamingProvider(chunks=["Reply 1."])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            # Turn 1
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "First question"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.kwargs_calls) >= 1:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.kwargs_calls), 1)
+            call1 = provider.kwargs_calls[0]
+            self.assertEqual(call1["prompt"], "First question")
+            self.assertIn("AEGIS", call1["system"])
+            self.assertIn("test-model:1b", call1["system"])
+
+            # Turn 2
+            provider.chunks = ["Reply 2."]
+            inp.value = "Second question"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.kwargs_calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.kwargs_calls), 2)
+            call2 = provider.kwargs_calls[1]
+            self.assertIn("AEGIS", call2["system"])
+            self.assertIn("test-model:1b", call2["system"])
+            self.assertIn("User: First question", call2["prompt"])
+            self.assertIn("Assistant: Reply 1.", call2["prompt"])
+            self.assertIn("User: Second question", call2["prompt"])
+
+    async def test_pilot_clear_during_generation_invalidates_and_does_not_repopulate(self) -> None:
+        """Clearing history while generation is active invalidates the turn and does not append orphan assistant message."""
+        event_continue = threading.Event()
+
+        class BlockingProvider:
+            name = "blocking-stream"
+            def __init__(self):
+                self.calls = []
+            def generate_stream(self, prompt, **kwargs):
+                self.calls.append(prompt)
+                yield "First chunk before clear. "
+                event_continue.wait(timeout=2.0)
+                yield "Second chunk after clear."
+
+        provider = BlockingProvider()
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "In-flight question"
+            inp.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+
+            # Assert generation is active and user turn is in conversation
+            self.assertTrue(app._generating)
+            self.assertEqual(len(app.conversation.messages()), 1)
+
+            # Trigger Ctrl+L (action_clear_history) while generation worker is active
+            app.action_clear_history()
+
+            # Now let worker proceed and finish
+            event_continue.set()
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            # Assert conversation was NOT populated with the completed assistant turn
+            self.assertEqual(len(app.conversation.messages()), 0)
+
+            # Second turn: submit fresh prompt and verify it doesn't contain orphaned turn
+            inp.value = "Clean prompt"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            # Second call must only send "Clean prompt"
+            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(provider.calls[1], "Clean prompt")

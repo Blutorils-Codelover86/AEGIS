@@ -150,7 +150,8 @@ class TestCLI(unittest.TestCase):
         self.assertIn("I am AEGIS AI assistant", out.getvalue())
         self.assertEqual(len(fake.calls), 1)
         self.assertEqual(fake.calls[0]["prompt"], "hi")
-        self.assertEqual(fake.calls[0]["system"], "Be helpful")
+        self.assertIn("Be helpful", fake.calls[0]["system"])
+        self.assertIn("AEGIS", fake.calls[0]["system"])
 
     def test_status_healthy_returns_zero(self) -> None:
         fake = FakeProvider(models=["model-a", "model-b"], is_healthy=True)
