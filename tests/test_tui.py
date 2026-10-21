@@ -497,7 +497,7 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             # Turn 1
             inp = app.query_one("#chat-input", Input)
-            inp.value = "Who are you?"
+            inp.value = "Hello assistant"
             inp.focus()
             await pilot.press("enter")
             for _ in range(30):
@@ -512,7 +512,7 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(turn1_messages[0]["role"], "system")
             self.assertIn("AEGIS", turn1_messages[0]["content"])
             self.assertIn("test-model:1b", turn1_messages[0]["content"])
-            self.assertEqual(turn1_messages[1], {"role": "user", "content": "Who are you?"})
+            self.assertEqual(turn1_messages[1], {"role": "user", "content": "Hello assistant"})
 
             # Turn 2
             inp.value = "What is the capital of France?"
@@ -528,7 +528,7 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             turn2_messages = provider.chat_stream_calls[1]
             self.assertEqual(len(turn2_messages), 4)
             self.assertEqual(turn2_messages[0]["role"], "system")
-            self.assertEqual(turn2_messages[1], {"role": "user", "content": "Who are you?"})
+            self.assertEqual(turn2_messages[1], {"role": "user", "content": "Hello assistant"})
             self.assertEqual(turn2_messages[2], {"role": "assistant", "content": "I am AEGIS assistant."})
             self.assertEqual(turn2_messages[3], {"role": "user", "content": "What is the capital of France?"})
 
@@ -705,3 +705,34 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             # Second call must only send "Clean prompt"
             self.assertEqual(len(provider.calls), 2)
             self.assertEqual(provider.calls[1], "Clean prompt")
+
+    async def test_pilot_authoritative_identity_handled_without_calling_provider(self) -> None:
+        """TUI handles direct identity questions authoritatively without querying the model provider."""
+        provider = FakeStreamingProvider(chunks=["Model hallucination"])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "What model are you using?"
+            inp.focus()
+            await pilot.press("enter")
+
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            # Provider was not called
+            self.assertEqual(len(provider.calls), 0)
+
+            # History has user and assistant messages
+            msgs = app.conversation.messages()
+            self.assertEqual(len(msgs), 2)
+            self.assertEqual(msgs[0]["content"], "What model are you using?")
+            self.assertIn("test-model:1b", msgs[1]["content"])
+
+            # Rendered markdown contains the model disclosure
+            rendered_mds = list(app.query(Markdown))
+            self.assertTrue(len(rendered_mds) > 0)
+            self.assertIn("test-model:1b", rendered_mds[-1].source)

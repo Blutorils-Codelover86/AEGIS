@@ -37,7 +37,7 @@ from aegis.cli.theme import (
 from aegis.config import AegisConfig, ensure_dirs
 from aegis.conversation import Conversation, format_conversation_prompt
 from aegis.errors import AegisError, MemoryStoreError, StopRequested
-from aegis.identity import identity_system_prompt
+from aegis.identity import authoritative_identity_response, identity_system_prompt
 from aegis.interfaces import AuditEvent, MemoryRecord, ModelProvider
 from aegis.provider.ollama import OllamaProvider
 from aegis.stop import StopController
@@ -342,7 +342,10 @@ def _stream_response(
 
     try:
         with thinking:
-            if hasattr(provider, "chat_stream"):
+            auth_reply = authoritative_identity_response(prompt, model=target_model)
+            if auth_reply is not None:
+                stream_iter = iter([auth_reply])
+            elif hasattr(provider, "chat_stream"):
                 messages: list[Mapping[str, str]] = []
                 if system_message:
                     messages.append(dict(system_message))
