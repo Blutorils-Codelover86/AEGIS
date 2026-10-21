@@ -409,6 +409,59 @@ class TestChatContinuity(unittest.TestCase):
         self.assertIn("Assistant: I will remember Omega.", call2["prompt"])
         self.assertIn("User: What was the code?", call2["prompt"])
 
+    def test_authoritative_identity_single_shot_bypasses_provider(self) -> None:
+        """Direct identity queries in single-shot chat answer authoritatively without calling model."""
+        provider = FakeChatProvider()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = main(
+                ["chat", "--prompt", "Who created AEGIS?", "--plain", "--model", "gemma3:1b"],
+                provider=provider,
+                config=self.config,
+            )
+        self.assertEqual(rc, 0)
+        # Model provider must not have been queried
+        self.assertEqual(len(provider.call_history), 0)
+        output = out.getvalue()
+        self.assertIn("Project AEGIS (Blu / Blutorils-Codelover86)", output)
+        self.assertIn("open-source", output)
+
+    def test_authoritative_identity_multiturn_continuity(self) -> None:
+        """Authoritative identity turn is recorded into conversation and forwarded to subsequent turns."""
+        provider = FakeChatProvider(responses=[["Here is a poem about shielding."]])
+        inputs = ["Who are you?", "Write a poem about that"]
+
+        with patch("builtins.input", side_effect=inputs):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = main(
+                    ["chat", "--plain", "--max-turns", "2", "--model", "qwen2.5-coder:1.5b"],
+                    provider=provider,
+                    config=self.config,
+                )
+        self.assertEqual(rc, 0)
+        output = out.getvalue()
+        self.assertIn("I am AEGIS, a local-first AI assistant", output)
+        self.assertIn("qwen2.5-coder:1.5b", output)
+        self.assertIn("Here is a poem about shielding.", output)
+
+        # Provider must only have been called for Turn 2
+        self.assertEqual(len(provider.call_history), 1)
+        call2 = provider.call_history[0]
+        messages = call2["messages"]
+        # messages[0] is system message
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("AEGIS", messages[0]["content"])
+        self.assertIn("qwen2.5-coder:1.5b", messages[0]["content"])
+        # messages[1] is turn 1 user
+        self.assertEqual(messages[1], {"role": "user", "content": "Who are you?"})
+        # messages[2] is turn 1 authoritative assistant response
+        self.assertEqual(messages[2]["role"], "assistant")
+        self.assertIn("I am AEGIS", messages[2]["content"])
+        self.assertIn("qwen2.5-coder:1.5b", messages[2]["content"])
+        # messages[3] is turn 2 user
+        self.assertEqual(messages[3], {"role": "user", "content": "Write a poem about that"})
+
 
 if __name__ == "__main__":
     unittest.main()

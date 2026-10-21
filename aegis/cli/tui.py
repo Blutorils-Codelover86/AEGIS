@@ -10,7 +10,7 @@ from aegis.cli.theme import ACCENT, header_info
 from aegis.config import AegisConfig
 from aegis.conversation import Conversation, format_conversation_prompt
 from aegis.errors import AegisError, StopRequested
-from aegis.identity import identity_system_prompt
+from aegis.identity import authoritative_identity_response, identity_system_prompt
 from aegis.interfaces import ModelProvider
 from aegis.stop import StopController
 
@@ -246,7 +246,16 @@ Input:focus {
             first = True
             try:
                 self._check_stop()
-                if hasattr(self.provider, "chat_stream"):
+                auth_reply = authoritative_identity_response(prompt, model=self.model)
+                if auth_reply is not None:
+                    if gen_id != self._active_generation_id or self._stop_event.is_set():
+                        return
+                    raw_parts.append(auth_reply)
+                    accum_stable = auth_reply
+                    self.call_from_thread(md_widget.update, accum_stable)
+                    self.call_from_thread(tail_widget.update, "")
+                    self.call_from_thread(self._scroll_history)
+                elif hasattr(self.provider, "chat_stream"):
                     messages = [self.system_message] + self.conversation.messages()
                     stream = self.provider.chat_stream(
                         messages,
