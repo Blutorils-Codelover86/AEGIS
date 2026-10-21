@@ -8,7 +8,7 @@ from typing import Any, Callable, Sequence
 from aegis.cli.render import StreamBuffer
 from aegis.cli.theme import ACCENT, header_info
 from aegis.config import AegisConfig
-from aegis.conversation import Conversation
+from aegis.conversation import Conversation, format_conversation_prompt
 from aegis.errors import AegisError, StopRequested
 from aegis.identity import identity_system_prompt
 from aegis.interfaces import ModelProvider
@@ -266,9 +266,15 @@ Input:focus {
                         self.call_from_thread(tail_widget.update, pending)
                         self.call_from_thread(self._scroll_history)
                 elif hasattr(self.provider, "generate_stream"):
+                    effective_system = (
+                        self.system_message["content"]
+                        if (self.system_message and "content" in self.system_message)
+                        else self.system
+                    )
+                    effective_prompt = format_conversation_prompt(self.conversation, prompt)
                     stream = self.provider.generate_stream(
-                        prompt,
-                        system=self.system,
+                        effective_prompt,
+                        system=effective_system,
                         model=self.model,
                         stop_check=self._check_stop,
                     )
@@ -289,9 +295,15 @@ Input:focus {
                         self.call_from_thread(tail_widget.update, pending)
                         self.call_from_thread(self._scroll_history)
                 else:
+                    effective_system = (
+                        self.system_message["content"]
+                        if (self.system_message and "content" in self.system_message)
+                        else self.system
+                    )
+                    effective_prompt = format_conversation_prompt(self.conversation, prompt)
                     response = self.provider.generate(
-                        prompt,
-                        system=self.system,
+                        effective_prompt,
+                        system=effective_system,
                         model=self.model,
                         stop_check=self._check_stop,
                     )

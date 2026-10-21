@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 
-from aegis.conversation import Conversation, Message
+from aegis.conversation import Conversation, Message, format_conversation_prompt
 
 
 class TestConversation(unittest.TestCase):
@@ -164,6 +164,35 @@ class TestConversation(unittest.TestCase):
         # Repeated call is safe no-op
         conv.discard_pending_user()
         self.assertEqual(len(conv.messages()), 2)
+
+    def test_format_conversation_prompt(self) -> None:
+        """format_conversation_prompt handles None, single-turn, and multi-turn properly."""
+        # 1. None conversation returns raw prompt
+        self.assertEqual(format_conversation_prompt(None, "hello"), "hello")
+
+        # 2. Empty conversation returns raw prompt
+        conv = Conversation()
+        self.assertEqual(format_conversation_prompt(conv, "hello"), "hello")
+
+        # 3. Single user turn matching prompt returns raw prompt
+        conv.add_user("hello")
+        self.assertEqual(format_conversation_prompt(conv, "hello"), "hello")
+
+        # 4. Multi-turn conversation formats User: and Assistant: turns
+        conv.add_assistant("Greetings! How can I assist you?")
+        conv.add_user("Remember code: ALPHA-7")
+        formatted = format_conversation_prompt(conv, "Remember code: ALPHA-7")
+        expected = (
+            "User: hello\n\n"
+            "Assistant: Greetings! How can I assist you?\n\n"
+            "User: Remember code: ALPHA-7"
+        )
+        self.assertEqual(formatted, expected)
+
+        # 5. If current prompt is not yet added to conversation, appends it
+        formatted2 = format_conversation_prompt(conv, "What was the code?")
+        self.assertIn("Assistant: Greetings! How can I assist you?", formatted2)
+        self.assertTrue(formatted2.endswith("User: What was the code?"))
 
 
 if __name__ == "__main__":

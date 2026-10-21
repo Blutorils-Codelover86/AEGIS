@@ -100,6 +100,77 @@ class FakeChatProvider(MultiTurnModelProvider):
         return True
 
 
+class FakeLegacyStreamProvider:
+    """Provider that implements only generate_stream (no chat_stream)."""
+
+    name = "fake-legacy-stream"
+
+    def __init__(self, responses: Sequence[str] | None = None) -> None:
+        self.responses = list(responses) if responses is not None else ["Answer 1", "Answer 2"]
+        self.call_history: list[dict[str, Any]] = []
+        self.turn_count = 0
+
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> Iterator[str]:
+        self.call_history.append({
+            "prompt": prompt,
+            "system": system,
+            "model": model,
+        })
+        idx = self.turn_count
+        self.turn_count += 1
+        resp = self.responses[idx] if idx < len(self.responses) else "Default answer"
+        yield resp
+
+    def list_models(self) -> list[str]:
+        return ["qwen2.5-coder:1.5b", "gemma3:1b"]
+
+    def health(self) -> bool:
+        return True
+
+
+class FakeLegacyGenerateProvider:
+    """Provider that implements only generate (no streaming)."""
+
+    name = "fake-legacy-generate"
+
+    def __init__(self, responses: Sequence[str] | None = None) -> None:
+        self.responses = list(responses) if responses is not None else ["Answer 1", "Answer 2"]
+        self.call_history: list[dict[str, Any]] = []
+        self.turn_count = 0
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system: str | None = None,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> str:
+        self.call_history.append({
+            "prompt": prompt,
+            "system": system,
+            "model": model,
+        })
+        idx = self.turn_count
+        self.turn_count += 1
+        return self.responses[idx] if idx < len(self.responses) else "Default answer"
+
+    def list_models(self) -> list[str]:
+        return ["qwen2.5-coder:1.5b", "gemma3:1b"]
+
+    def health(self) -> bool:
+        return True
+
+
 class TestChatContinuity(unittest.TestCase):
     """Test conversation continuity and identity injection."""
 
@@ -256,6 +327,64 @@ class TestChatContinuity(unittest.TestCase):
         with patch.object(provider, "_open", return_value=mock_chat_resp):
             res = provider.chat(messages)
             self.assertEqual(res, "full answer")
+
+    def test_legacy_generate_stream_receives_identity_and_continuity(self) -> None:
+        """Legacy provider implementing only generate_stream receives identity and conversation context."""
+        provider = FakeLegacyStreamProvider(responses=["I will remember Project Chimera.", "The project is Chimera."])
+        inputs = ["Remember project name: Chimera", "What was the project name?"]
+
+        with patch("builtins.input", side_effect=inputs):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = main(
+                    ["chat", "--plain", "--max-turns", "2"],
+                    provider=provider,
+                    config=self.config,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.call_history), 2)
+
+        # Turn 1: receives composed identity system prompt and initial prompt
+        call1 = provider.call_history[0]
+        self.assertIn("AEGIS", call1["system"])
+        self.assertIn("qwen2.5-coder:1.5b", call1["system"])
+        self.assertEqual(call1["prompt"], "Remember project name: Chimera")
+
+        # Turn 2: receives composed identity system prompt and formatted multi-turn history
+        call2 = provider.call_history[1]
+        self.assertIn("AEGIS", call2["system"])
+        self.assertIn("qwen2.5-coder:1.5b", call2["system"])
+        self.assertIn("User: Remember project name: Chimera", call2["prompt"])
+        self.assertIn("Assistant: I will remember Project Chimera.", call2["prompt"])
+        self.assertIn("User: What was the project name?", call2["prompt"])
+
+    def test_legacy_generate_receives_identity_and_continuity(self) -> None:
+        """Legacy provider implementing only generate receives identity and conversation context."""
+        provider = FakeLegacyGenerateProvider(responses=["I will remember Omega.", "The code is Omega."])
+        inputs = ["Remember code: Omega", "What was the code?"]
+
+        with patch("builtins.input", side_effect=inputs):
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = main(
+                    ["chat", "--plain", "--max-turns", "2"],
+                    provider=provider,
+                    config=self.config,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(provider.call_history), 2)
+
+        # Turn 1
+        call1 = provider.call_history[0]
+        self.assertIn("AEGIS", call1["system"])
+        self.assertEqual(call1["prompt"], "Remember code: Omega")
+
+        # Turn 2: formatted history
+        call2 = provider.call_history[1]
+        self.assertIn("AEGIS", call2["system"])
+        self.assertIn("User: Remember code: Omega", call2["prompt"])
+        self.assertIn("Assistant: I will remember Omega.", call2["prompt"])
+        self.assertIn("User: What was the code?", call2["prompt"])
 
 
 if __name__ == "__main__":

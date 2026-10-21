@@ -77,3 +77,27 @@ class Conversation:
                 count += 1
                 has_user = False
         return count
+
+
+def format_conversation_prompt(conversation: Conversation | None, prompt: str) -> str:
+    """Format conversation history into a unified prompt string for single-turn model providers.
+
+    If conversation is None, empty, or contains only a single user message matching the prompt,
+    the raw prompt is returned unchanged.
+    Otherwise, prior exchanges and the current prompt are formatted as sequential turns:
+    'User: ...\\n\\nAssistant: ...'
+    """
+    if conversation is None:
+        return prompt
+    messages = conversation.messages()
+    if not messages:
+        return prompt
+    if len(messages) == 1 and messages[0].get("role") == "user" and messages[0].get("content") == prompt:
+        return prompt
+    lines: list[str] = []
+    for msg in messages:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        lines.append(f"{role}: {msg.get('content', '')}")
+    if messages[-1].get("content") != prompt:
+        lines.append(f"User: {prompt}")
+    return "\n\n".join(lines)

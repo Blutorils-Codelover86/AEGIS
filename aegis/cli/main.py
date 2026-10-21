@@ -35,7 +35,7 @@ from aegis.cli.theme import (
     print_user,
 )
 from aegis.config import AegisConfig, ensure_dirs
-from aegis.conversation import Conversation
+from aegis.conversation import Conversation, format_conversation_prompt
 from aegis.errors import AegisError, MemoryStoreError, StopRequested
 from aegis.identity import identity_system_prompt
 from aegis.interfaces import AuditEvent, MemoryRecord, ModelProvider
@@ -356,24 +356,36 @@ def _stream_response(
                     stop_check=stop_ctrl.check,
                 )
             elif hasattr(provider, "generate_stream"):
+                effective_system = (
+                    system_message["content"]
+                    if (system_message and "content" in system_message)
+                    else system
+                )
+                effective_prompt = format_conversation_prompt(conversation, prompt)
                 stream_iter = provider.generate_stream(
-                    prompt,
-                    system=system,
+                    effective_prompt,
+                    system=effective_system,
                     model=target_model,
                     stop_check=stop_ctrl.check,
                 )
             else:
+                effective_system = (
+                    system_message["content"]
+                    if (system_message and "content" in system_message)
+                    else system
+                )
+                effective_prompt = format_conversation_prompt(conversation, prompt)
                 try:
                     res = provider.generate(
-                        prompt,
-                        system=system,
+                        effective_prompt,
+                        system=effective_system,
                         model=target_model,
                         stop_check=stop_ctrl.check,
                     )
                 except TypeError:
                     res = provider.generate(
-                        prompt,
-                        system=system,
+                        effective_prompt,
+                        system=effective_system,
                         model=target_model,
                     )
                 stream_iter = iter([res])

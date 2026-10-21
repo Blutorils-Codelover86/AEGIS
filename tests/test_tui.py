@@ -323,7 +323,11 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
         )
 
         async with app.run_test() as pilot:
-            await pilot.pause(0.25)
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
             history = app.query_one("#chat-history", VerticalScroll)
             md_widgets = list(history.query(Markdown))
             self.assertTrue(len(md_widgets) >= 1)
@@ -357,9 +361,13 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await pilot.pause(0.25)
             self.assertEqual(len(provider.kwargs_calls), 1)
-            self.assertEqual(
-                provider.kwargs_calls[0]["system"],
+            self.assertIn(
                 "You are an ethical assistant with strict boundaries.",
+                provider.kwargs_calls[0]["system"],
+            )
+            self.assertIn(
+                "AEGIS",
+                provider.kwargs_calls[0]["system"],
             )
 
     async def test_pilot_hostile_splits_and_partial_formatting(self) -> None:
@@ -598,3 +606,45 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
 
             # Assert user 2
             self.assertEqual(turn2_messages[3], {"role": "user", "content": "Followup question"})
+
+    async def test_pilot_legacy_generate_stream_continuity(self) -> None:
+        """Verify TUI legacy provider (generate_stream only) receives composed identity and multi-turn context."""
+        provider = FakeStreamingProvider(chunks=["Reply 1."])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            # Turn 1
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "First question"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.kwargs_calls) >= 1:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.kwargs_calls), 1)
+            call1 = provider.kwargs_calls[0]
+            self.assertEqual(call1["prompt"], "First question")
+            self.assertIn("AEGIS", call1["system"])
+            self.assertIn("test-model:1b", call1["system"])
+
+            # Turn 2
+            provider.chunks = ["Reply 2."]
+            inp.value = "Second question"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.kwargs_calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.kwargs_calls), 2)
+            call2 = provider.kwargs_calls[1]
+            self.assertIn("AEGIS", call2["system"])
+            self.assertIn("test-model:1b", call2["system"])
+            self.assertIn("User: First question", call2["prompt"])
+            self.assertIn("Assistant: Reply 1.", call2["prompt"])
+            self.assertIn("User: Second question", call2["prompt"])
