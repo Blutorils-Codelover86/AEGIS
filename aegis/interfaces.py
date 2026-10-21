@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
 
 
 class Decision(str, Enum):
@@ -137,6 +137,29 @@ class ModelProvider(Protocol):
     def list_models(self) -> list[str]: ...
 
     def health(self) -> bool: ...
+
+
+@runtime_checkable
+class MultiTurnModelProvider(ModelProvider, Protocol):
+    """Multi-turn model provider protocol supporting structured chat exchanges."""
+
+    def chat(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> str: ...
+
+    def chat_stream(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> Iterator[str]: ...
 
 
 @dataclass(frozen=True)
