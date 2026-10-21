@@ -34,7 +34,9 @@ from aegis.cli.theme import (
     print_user,
 )
 from aegis.config import AegisConfig, ensure_dirs
+from aegis.conversation import Conversation
 from aegis.errors import AegisError, MemoryStoreError, StopRequested
+from aegis.identity import identity_system_prompt
 from aegis.interfaces import AuditEvent, MemoryRecord, ModelProvider
 from aegis.provider.ollama import OllamaProvider
 from aegis.stop import StopController
@@ -313,6 +315,8 @@ def main(
 def _stream_response(
     prompt: str,
     *,
+    conversation: Conversation | None = None,
+    system_message: Mapping[str, str] | None = None,
     provider: ModelProvider,
     config: AegisConfig,
     model: str | None,
@@ -330,10 +334,24 @@ def _stream_response(
     t0 = time.monotonic()
     first_chunk = True
     last_chunk = ""
+    accumulated_chunks: list[str] = []
 
     try:
         with thinking:
-            if hasattr(provider, "generate_stream"):
+            if hasattr(provider, "chat_stream"):
+                messages: list[Mapping[str, str]] = []
+                if system_message:
+                    messages.append(dict(system_message))
+                if conversation is not None:
+                    messages.extend(conversation.messages())
+                else:
+                    messages.append({"role": "user", "content": prompt})
+                stream_iter = provider.chat_stream(
+                    messages,
+                    model=target_model,
+                    stop_check=stop_ctrl.check,
+                )
+            elif hasattr(provider, "generate_stream"):
                 stream_iter = provider.generate_stream(
                     prompt,
                     system=system,
@@ -366,6 +384,7 @@ def _stream_response(
 
                 chunk_count += 1
                 last_chunk = chunk
+                accumulated_chunks.append(chunk)
                 elapsed = time.monotonic() - t0
                 stream_ind.update(chunks=chunk_count, elapsed=elapsed)
 
@@ -394,6 +413,12 @@ def _stream_response(
 
         elapsed = time.monotonic() - t0
         completion(console, caps, elapsed, chunk_count)
+
+        if conversation is not None:
+            full_assistant_reply = "".join(accumulated_chunks)
+            if full_assistant_reply:
+                conversation.add_assistant(full_assistant_reply)
+
         return 0
     except KeyboardInterrupt:
         thinking.stop()
@@ -402,6 +427,8 @@ def _stream_response(
             remaining = buf.flush()
             if remaining:
                 render_plain(console, remaining)
+        if conversation is not None and conversation._messages and conversation._messages[-1].role == "user":
+            conversation._messages.pop()
         print("\n[Stop requested by user]")
         return 130
     except StopRequested as e:
@@ -411,6 +438,8 @@ def _stream_response(
             remaining = buf.flush()
             if remaining:
                 render_plain(console, remaining)
+        if conversation is not None and conversation._messages and conversation._messages[-1].role == "user":
+            conversation._messages.pop()
         print(f"\n[Operation stopped: {e}]", file=sys.stderr)
         return 130
 
@@ -426,6 +455,10 @@ def _handle_chat(
     if console is None:
         console = make_console(plain=is_plain)
 
+    target_model = args.model or config.model
+    system_text = identity_system_prompt(model=target_model, user_system=args.system)
+    system_msg = {"role": "system", "content": system_text}
+
     if getattr(args, "tui", False):
         if not sys.stdout.isatty():
             sys.stderr.write("Textual TUI requires a TTY. Falling back to terminal chat.\n")
@@ -439,6 +472,7 @@ def _handle_chat(
                     system=args.system,
                     initial_prompt=args.prompt,
                     no_memory=getattr(args, "no_memory", False),
+                    max_turns=getattr(args, "max_turns", None),
                 )
             except ImportError as err:
                 sys.stderr.write(f"Textual TUI is not installed ({err}). Falling back to terminal chat. Install with: pip install 'aegis-ai[tui]'\n")
@@ -451,8 +485,12 @@ def _handle_chat(
             stop_ctrl.check()
             if not is_plain:
                 print_header(console, config, args.model)
+            conv = Conversation(max_turns=1)
+            conv.add_user(args.prompt)
             rc = _stream_response(
                 args.prompt,
+                conversation=conv,
+                system_message=system_msg,
                 provider=provider,
                 config=config,
                 model=args.model,
@@ -471,7 +509,8 @@ def _handle_chat(
             return 130
 
     # Interactive REPL
-    max_turns = args.max_turns if args.max_turns is not None else config.max_chat_turns
+    resolved_max_turns = args.max_turns if args.max_turns is not None else config.max_chat_turns
+    conversation = Conversation(max_turns=resolved_max_turns)
     turn = 0
     if not is_plain:
         print_header(console, config, args.model)
@@ -483,7 +522,7 @@ def _handle_chat(
         print(f"AEGIS Chat ({args.model or config.model}) - Ctrl+C to exit")
 
     try:
-        while turn < max_turns:
+        while turn < resolved_max_turns:
             stop_ctrl.check()
             try:
                 user_input = input("aegis> ")
@@ -498,8 +537,11 @@ def _handle_chat(
                 continue
 
             turn += 1
+            conversation.add_user(stripped)
             rc = _stream_response(
                 stripped,
+                conversation=conversation,
+                system_message=system_msg,
                 provider=provider,
                 config=config,
                 model=args.model,
