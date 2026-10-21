@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 from unittest.mock import MagicMock, patch
 
 from aegis.config import AegisConfig
@@ -56,6 +56,40 @@ class FakeStreamingProvider:
             if self.raise_stop:
                 raise StopRequested("Interrupted by test")
             yield chunk
+
+    def list_models(self) -> list[str]:
+        return ["fake-model:latest"]
+
+    def health(self) -> bool:
+        return True
+
+
+class FakeMultiTurnChatProvider:
+    """Mock provider with chat_stream multi-turn support for TUI testing."""
+
+    name = "fake-multiturn-chat"
+
+    def __init__(self, responses: Sequence[Sequence[str]]) -> None:
+        self.responses = list(responses)
+        self.chat_stream_calls: list[list[dict[str, str]]] = []
+        self._turn = 0
+
+    def chat_stream(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        *,
+        model: str | None = None,
+        stop: Sequence[str] | None = None,
+        stop_check: Callable[[], None] | None = None,
+    ) -> Iterator[str]:
+        self.chat_stream_calls.append([dict(m) for m in messages])
+        idx = self._turn
+        self._turn += 1
+        chunks = self.responses[idx] if idx < len(self.responses) else ["Default answer"]
+        for c in chunks:
+            if stop_check:
+                stop_check()
+            yield c
 
     def list_models(self) -> list[str]:
         return ["fake-model:latest"]
@@ -442,3 +476,68 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             await pilot.pause(0.1)
             # Verify stop event was set
             self.assertTrue(app._stop_event.is_set())
+
+    async def test_pilot_multi_turn_identity_and_prior_turns(self) -> None:
+        """TUI chat_stream injects identity system prompt and maintains conversation history across turns."""
+        provider = FakeMultiTurnChatProvider([
+            ["I am AEGIS assistant."],
+            ["Paris is the capital of France."],
+        ])
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            # Turn 1
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "Who are you?"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 1:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 1)
+            turn1_messages = provider.chat_stream_calls[0]
+            self.assertEqual(len(turn1_messages), 2)
+            self.assertEqual(turn1_messages[0]["role"], "system")
+            self.assertIn("AEGIS", turn1_messages[0]["content"])
+            self.assertIn("test-model:1b", turn1_messages[0]["content"])
+            self.assertEqual(turn1_messages[1], {"role": "user", "content": "Who are you?"})
+
+            # Turn 2
+            inp.value = "What is the capital of France?"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.chat_stream_calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(provider.chat_stream_calls), 2)
+            turn2_messages = provider.chat_stream_calls[1]
+            self.assertEqual(len(turn2_messages), 4)
+            self.assertEqual(turn2_messages[0]["role"], "system")
+            self.assertEqual(turn2_messages[1], {"role": "user", "content": "Who are you?"})
+            self.assertEqual(turn2_messages[2], {"role": "assistant", "content": "I am AEGIS assistant."})
+            self.assertEqual(turn2_messages[3], {"role": "user", "content": "What is the capital of France?"})
+
+            self.assertEqual(len(app.conversation), 2)
+
+    async def test_pilot_clear_history_clears_conversation(self) -> None:
+        """action_clear_history clears both the widget tree and the internal Conversation state."""
+        provider = FakeMultiTurnChatProvider([["Hello back!"]])
+        app = AegisTUI(self.config, provider, initial_prompt="Hello")
+
+        async with app.run_test() as pilot:
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            self.assertEqual(len(app.conversation), 1)
+            app.action_clear_history()
+            self.assertEqual(len(app.conversation), 0)
+            self.assertEqual(app.conversation.messages(), [])
