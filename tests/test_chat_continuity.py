@@ -328,6 +328,29 @@ class TestChatContinuity(unittest.TestCase):
             res = provider.chat(messages)
             self.assertEqual(res, "full answer")
 
+    def test_ollama_provider_premature_eof_raises_provider_error(self) -> None:
+        """Premature EOF without done: true raises ProviderError."""
+        from aegis.errors import ProviderError
+        from aegis.provider.ollama import OllamaProvider
+
+        provider = OllamaProvider(host="http://127.0.0.1:11434", default_model="qwen2.5-coder:1.5b")
+        mock_resp = MagicMock()
+        mock_resp.readline.side_effect = [
+            b'{"model":"qwen2.5-coder:1.5b","message":{"role":"assistant","content":"partial chunk"},"done":false}\n',
+            b"",  # Premature EOF
+        ]
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.fileno.side_effect = OSError("no fileno")
+
+        messages = [{"role": "user", "content": "hello"}]
+        with patch.object(provider, "_cancellable_open", return_value=mock_resp):
+            stream = provider.chat_stream(messages)
+            first_chunk = next(stream)
+            self.assertEqual(first_chunk, "partial chunk")
+            with self.assertRaises(ProviderError) as ctx:
+                next(stream)
+            self.assertIn("missing done: true", str(ctx.exception))
+
     def test_legacy_generate_stream_receives_identity_and_continuity(self) -> None:
         """Legacy provider implementing only generate_stream receives identity and conversation context."""
         provider = FakeLegacyStreamProvider(responses=["I will remember Project Chimera.", "The project is Chimera."])

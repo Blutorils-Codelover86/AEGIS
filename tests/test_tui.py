@@ -5,6 +5,7 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Callable, Iterator, Mapping, Sequence
@@ -648,3 +649,59 @@ class TestTUIPilot(unittest.IsolatedAsyncioTestCase):
             self.assertIn("User: First question", call2["prompt"])
             self.assertIn("Assistant: Reply 1.", call2["prompt"])
             self.assertIn("User: Second question", call2["prompt"])
+
+    async def test_pilot_clear_during_generation_invalidates_and_does_not_repopulate(self) -> None:
+        """Clearing history while generation is active invalidates the turn and does not append orphan assistant message."""
+        event_continue = threading.Event()
+
+        class BlockingProvider:
+            name = "blocking-stream"
+            def __init__(self):
+                self.calls = []
+            def generate_stream(self, prompt, **kwargs):
+                self.calls.append(prompt)
+                yield "First chunk before clear. "
+                event_continue.wait(timeout=2.0)
+                yield "Second chunk after clear."
+
+        provider = BlockingProvider()
+        app = AegisTUI(self.config, provider, model="test-model:1b")
+
+        async with app.run_test() as pilot:
+            inp = app.query_one("#chat-input", Input)
+            inp.value = "In-flight question"
+            inp.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+
+            # Assert generation is active and user turn is in conversation
+            self.assertTrue(app._generating)
+            self.assertEqual(len(app.conversation.messages()), 1)
+
+            # Trigger Ctrl+L (action_clear_history) while generation worker is active
+            app.action_clear_history()
+
+            # Now let worker proceed and finish
+            event_continue.set()
+            for _ in range(30):
+                if not app._generating:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            # Assert conversation was NOT populated with the completed assistant turn
+            self.assertEqual(len(app.conversation.messages()), 0)
+
+            # Second turn: submit fresh prompt and verify it doesn't contain orphaned turn
+            inp.value = "Clean prompt"
+            inp.focus()
+            await pilot.press("enter")
+            for _ in range(30):
+                if not app._generating and len(provider.calls) >= 2:
+                    break
+                await pilot.pause(0.05)
+            await pilot.pause(0.1)
+
+            # Second call must only send "Clean prompt"
+            self.assertEqual(len(provider.calls), 2)
+            self.assertEqual(provider.calls[1], "Clean prompt")

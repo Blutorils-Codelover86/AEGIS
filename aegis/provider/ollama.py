@@ -596,6 +596,11 @@ class OllamaProvider:
             self._last_error = msg
             raise ProviderError(msg)
 
+        if not data.get("done", False):
+            msg = "Ollama response incomplete (missing done: true)"
+            self._last_error = msg
+            raise ProviderError(msg)
+
         msg_obj = data.get("message")
         if not isinstance(msg_obj, dict) or "content" not in msg_obj or msg_obj["content"] is None:
             msg = "Ollama response missing 'message.content' field"
@@ -668,6 +673,7 @@ class OllamaProvider:
             self._last_error = msg
             raise ProviderError(msg) from e
 
+        terminal_done = False
         try:
             with resp:
                 deadline = time.monotonic() + self.timeout
@@ -730,10 +736,16 @@ class OllamaProvider:
                         yield str(delta)
 
                     if data.get("done", False):
+                        terminal_done = True
                         break
 
                     if stop_check is not None:
                         stop_check()
+
+                if not terminal_done:
+                    msg = "Ollama connection closed before stream completion (missing done: true)"
+                    self._last_error = msg
+                    raise ProviderError(msg)
 
         except StopRequested:
             raise
